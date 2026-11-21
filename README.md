@@ -6,13 +6,12 @@ One static Rust binary that reads the CSV inputs in `$DATA_DIR`, applies every r
 
 The phases, each spread over `$NCPU` threads:
 
-1. **Links.** Parse `links/`, then a union-find joins the IDs. Each ID maps to its person's name, the byte-wise smallest ID in its group.
-2. **Parse.** All event and click files are memory-mapped and cut into line-aligned 8 MB chunks. A hand-written splitter applies the CSV dialect exactly: whole-field quotes only, exact field counts, `\r` as data. Each event copy is validated as it is parsed, and the late check is folded in. Events are bucketed by `event_id`. Clicks are bucketed by person.
-3. **Dedup.** For each `event_id` bucket, keep the copy with the smallest `ingest_ts`. The survivors that are valid are re-bucketed by person.
-4. **Persons.** Each person bucket is sorted by (person, ts) and split into sessions on gaps over 30 min. Each session is credited to the latest click within 7 days, with ties going to the smallest `click_id`. For assists, each campaign's clicks are merged into intervals `[t, t + 7d]`, and the sessions starting inside them are counted per day.
-5. **Write.** Uncompressed Parquet: one `user_daily` file per thread and one `campaign_daily` file.
+1. **Parse.** All files are memory-mapped and cut into line-aligned 4 MB chunks. An AVX2 scan finds `,`, `\n` and `"` 64 bytes at a time. A line's quoting is valid exactly when its quote count is twice the number of fields wrapped in quotes, so validity takes one popcount per line. Timestamps are parsed with SWAR. Each event copy is validated as it is parsed, with the late check folded in, and goes to a bucket by `event_id`. Meanwhile one thread reads `links/`, and a union-find maps each ID to its person's name, the byte-wise smallest ID in the group. Clicks are parsed last, using that map, and go to a bucket by person.
+2. **Dedup.** For each `event_id` bucket, an open-addressing table keeps the copy with the smallest `ingest_ts`. Valid survivors are re-bucketed by person.
+3. **Persons.** In each person bucket, a small table gives each person a dense index, and a counting sort groups their events and clicks. Then each person's events are sorted by ts and split into sessions on gaps over 30 min. Each session is credited to the latest click within 7 days, with ties going to the smallest `click_id`. For assists, each campaign's clicks are merged into intervals `[t, t + 7d]`, and the sessions starting inside them are counted per day.
+4. **Write.** Uncompressed Parquet: one `user_daily` file per thread and one `campaign_daily` file.
 
-Strings are keyed as `u128`. Up to 15 bytes are packed big-endian with the length in the low byte, which is exact and sorts byte-wise. Longer strings get a 120-bit hash and are kept in a side table.
+IDs of 1 to 10 ASCII letters and digits (all the generator writes) pack exactly into a `u64` whose order is byte-wise. Any other ID gets a hashed key, and its bytes are kept aside. Times are `u32` milliseconds from `window_start - 7 days`. With these, an event copy is 32 bytes and a surviving event 16. Bucket buffers are per-thread arenas backed by huge pages.
 
 Click duplicates are not removed: copies are identical, so they cannot change a credit or an assist.
 

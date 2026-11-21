@@ -11,7 +11,8 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::Type;
 
-use crate::{key_bytes, CampStat, Ctx, Longs, PersonOut, UserRow};
+use crate::ids::{self, Odd};
+use crate::{CampStat, Ctx, PersonOut, UserRow};
 
 const USER_SCHEMA: &str = "message user_daily {
     REQUIRED BYTE_ARRAY user_id (UTF8);
@@ -68,9 +69,9 @@ fn write_file(path: &Path, schema: Arc<Type>, cols: Vec<Col>) {
     writer.close().expect("close file");
 }
 
-fn user_cols(rows: &[UserRow], ctx: &Ctx, longs: &Longs) -> Vec<Col> {
-    let mut buf = [0u8; 16];
-    let ids = rows.iter().map(|r| ByteArray::from(key_bytes(r.person, &mut buf, longs).to_vec())).collect();
+fn user_cols(rows: &[UserRow], ctx: &Ctx, odd: &Odd) -> Vec<Col> {
+    let mut buf = [0u8; 10];
+    let ids = rows.iter().map(|r| ByteArray::from(ids::bytes(r.person, &mut buf, odd).to_vec())).collect();
     let cats: Vec<ByteArray> = ctx.categories.iter().map(|c| ByteArray::from(c.to_vec())).collect();
     let tops = rows.iter().filter(|r| r.top >= 0).map(|r| cats[r.top as usize].clone()).collect();
     let def = rows.iter().map(|r| (r.top >= 0) as i16).collect();
@@ -84,7 +85,7 @@ fn user_cols(rows: &[UserRow], ctx: &Ctx, longs: &Longs) -> Vec<Col> {
     ]
 }
 
-pub fn write_all(out: &Path, ctx: &Ctx, longs: &Longs, parts: &mut [PersonOut]) {
+pub fn write_all(out: &Path, ctx: &Ctx, odd: &Odd, parts: &mut [PersonOut]) {
     let user_dir = out.join("user_daily");
     let camp_dir = out.join("campaign_daily");
     fs::create_dir_all(&user_dir).expect("mkdir user_daily");
@@ -112,7 +113,7 @@ pub fn write_all(out: &Path, ctx: &Ctx, longs: &Longs, parts: &mut [PersonOut]) 
             }
             let path = user_dir.join(format!("part-{i:05}.parquet"));
             let schema = user_schema.clone();
-            sc.spawn(move || write_file(&path, schema, user_cols(rows, ctx, longs)));
+            sc.spawn(move || write_file(&path, schema, user_cols(rows, ctx, odd)));
         }
 
         let (mut ids, mut channels, mut days) = (Vec::new(), Vec::new(), Vec::new());

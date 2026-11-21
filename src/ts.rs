@@ -10,11 +10,6 @@ fn digit(c: u8) -> Option<i64> {
     }
 }
 
-#[inline]
-fn d2(s: &[u8], i: usize) -> Option<i64> {
-    Some(digit(s[i])? * 10 + digit(s[i + 1])?)
-}
-
 pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
@@ -37,55 +32,104 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
+#[inline(always)]
+fn load8(s: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(s[i..i + 8].try_into().unwrap())
+}
+
+const ZEROS: u64 = 0x3030_3030_3030_3030;
+
+/// Whether every byte selected by `mask` (0xFF per byte) is an ASCII digit.
+#[inline(always)]
+fn all_digits(w: u64, mask: u64) -> bool {
+    let x = w ^ ZEROS;
+    let bad = ((x & 0x7f7f_7f7f_7f7f_7f7f).wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080;
+    bad & mask == 0
+}
+
+/// Byte i of the result is 10 * digit(i) + digit(i + 1), for the digit
+/// bytes selected by `mask`.
+#[inline(always)]
+fn pairs(w: u64, mask: u64) -> u64 {
+    let x = (w ^ ZEROS) & mask;
+    x.wrapping_mul(10).wrapping_add(x >> 8)
+}
+
 /// Milliseconds since the epoch, or None for a bad timestamp. An F3 value too
 /// large for i64 is None too: it is outside every window anyway.
 #[inline]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
     let n = s.len();
+    if (n == 20 || n == 25) && s[4] == b'-' {
+        return parse_iso(s);
+    }
     if n == 0 {
         return None;
     }
-    if n != 20 && n != 25 || s[4] != b'-' {
-        let mut v: i64 = 0;
+    let mut v: i64 = 0;
+    if n <= 18 {
+        for &c in s {
+            v = v * 10 + digit(c)?;
+        }
+    } else {
         for &c in s {
             v = v.checked_mul(10)?.checked_add(digit(c)?)?;
         }
-        return Some(v);
     }
-    if s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+    Some(v)
+}
+
+/// F1 `YYYY-MM-DDTHH:MM:SSZ` or F2 `YYYY-MM-DDTHH:MM:SS+HH:MM`.
+#[inline]
+fn parse_iso(s: &[u8]) -> Option<i64> {
+    // Little-endian: byte 0 of each word is its first character.
+    let a = load8(s, 0); // YYYY-MM-
+    let b = load8(s, 8); // DDTHH:MM
+    let c = load8(s, 12); // H:MM:SS? (byte 4 ':', bytes 5-6 the seconds, byte 7 'Z' or the sign)
+    const A_DIG: u64 = 0x00ff_ff00_ffff_ffff;
+    const B_DIG: u64 = 0xffff_00ff_ff00_ffff;
+    const C_DIG: u64 = 0x00ff_ff00_0000_0000;
+    const A_SEP: u64 = 0xff00_00ff_0000_0000;
+    const B_SEP: u64 = 0x0000_ff00_00ff_0000;
+    const C_SEP: u64 = 0x0000_00ff_0000_0000;
+    if !all_digits(a, A_DIG) || !all_digits(b, B_DIG) || !all_digits(c, C_DIG) {
         return None;
     }
-    let year = d2(s, 0)? * 100 + d2(s, 2)?;
-    let month = d2(s, 5)?;
-    let day = d2(s, 8)?;
-    let hour = d2(s, 11)?;
-    let minute = d2(s, 14)?;
-    let second = d2(s, 17)?;
-    if !(1..=12).contains(&month)
-        || day < 1
-        || day > days_in_month(year, month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
+    if a & A_SEP != 0x2d00_002d_0000_0000 || b & B_SEP != 0x0000_3a00_0054_0000 || c & C_SEP != 0x0000_003a_0000_0000 {
+        return None;
+    }
+    let pa = pairs(a, A_DIG);
+    let pb = pairs(b, B_DIG);
+    let pc = pairs(c, C_DIG);
+    let year = ((pa & 0xff) * 100 + ((pa >> 16) & 0xff)) as i64;
+    let month = ((pa >> 40) & 0xff) as i64;
+    let day = (pb & 0xff) as i64;
+    let hour = ((pb >> 24) & 0xff) as i64;
+    let minute = ((pb >> 48) & 0xff) as i64;
+    let second = ((pc >> 40) & 0xff) as i64;
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
     let mut t = ((days_from_civil(year, month, day) * 24 + hour) * 60 + minute) * 60 + second;
-    if n == 20 {
-        if s[19] != b'Z' {
+    let zone = (c >> 56) as u8;
+    if s.len() == 20 {
+        if zone != b'Z' {
             return None;
         }
     } else {
-        let sign = match s[19] {
+        let sign = match zone {
             b'+' => 1,
             b'-' => -1,
             _ => return None,
         };
-        if s[22] != b':' {
+        let d = load8(s, 17); // SS+HH:MM
+        const D_DIG: u64 = 0xffff_00ff_ff00_0000;
+        if !all_digits(d, D_DIG) || (d >> 40) as u8 != b':' {
             return None;
         }
-        let oh = d2(s, 20)?;
-        let om = d2(s, 23)?;
+        let pd = pairs(d, D_DIG);
+        let oh = ((pd >> 24) & 0xff) as i64;
+        let om = ((pd >> 48) & 0xff) as i64;
         if oh > 23 || om > 59 {
             return None;
         }
