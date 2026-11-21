@@ -96,6 +96,13 @@ fn unwrap_field(chunk: &[u8], s: usize, e: usize) -> (usize, usize, usize) {
 }
 
 impl Line<'_> {
+    /// Field i (i < N), and whether 16 bytes from its start are readable.
+    #[inline(always)]
+    pub fn get_w(&self, i: usize) -> (&'static [u8], bool) {
+        let f = self.get(i);
+        (f, self.bounds[i][0] as usize + 16 <= self.chunk.len())
+    }
+
     /// Field i (i < N).
     #[inline(always)]
     pub fn get(&self, i: usize) -> &'static [u8] {

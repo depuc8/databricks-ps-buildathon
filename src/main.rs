@@ -263,7 +263,6 @@ struct Ev {
     _pad: u32,
 }
 
-const EMPTY_EV: Ev = Ev { eid: 0, uid: 0, ingest: 0, ts: 0, pc: 0, _pad: 0 };
 
 /// A surviving event: pc = price | category << 24 (price 0: not a purchase).
 #[derive(Clone, Copy)]
@@ -702,7 +701,8 @@ struct ParseOut {
 
 struct DedupOut {
     pe: Arena<Pe>,
-    table: Vec<Ev>,
+    table: Vec<(u64, u64)>,
+    filled: Vec<u32>,
     keys: Vec<u64>,
     rest: Vec<(u32, u32)>,
     maybe: Vec<bool>,
@@ -723,6 +723,7 @@ pub struct PersonOut {
 #[derive(Default)]
 struct Group {
     table: Vec<(u64, u32)>,
+    filled: Vec<u32>,
     persons: Vec<u64>,
     local: Vec<u32>,
     starts: Vec<u32>,
@@ -752,6 +753,7 @@ impl Group {
         let table = &mut self.table[..size];
         self.persons.clear();
         self.local.clear();
+        self.filled.clear();
         for part in ev_parts {
             for e in *part {
                 let mut i = Self::slot(e.person, mask);
@@ -764,6 +766,7 @@ impl Group {
                         let v = self.persons.len() as u32;
                         table[i] = (e.person, v);
                         self.persons.push(e.person);
+                        self.filled.push(i as u32);
                         break v;
                     }
                     i = (i + 1) & mask;
@@ -804,7 +807,9 @@ impl Group {
                 self.cks[a..b].sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| ids::cmp(y.id, x.id, odd)));
             }
         }
-        table.fill((0, 0));
+        for &i in &self.filled {
+            table[i as usize] = (0, 0);
+        }
     }
 }
 
@@ -858,7 +863,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
-        .max(1);
+        .clamp(1, 32);
 
     // ---- small inputs
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
@@ -1003,6 +1008,7 @@ fn main() {
         .map(|_| DedupOut {
             pe: Arena::new(nb_p, per(n_ev, nb_p)),
             table: Vec::new(),
+            filled: Vec::new(),
             keys: Vec::new(),
             rest: Vec::new(),
             maybe: Vec::new(),
@@ -1013,42 +1019,56 @@ fn main() {
         let links = &links;
         run_par(&mut dedup_outs, nb_ev, |out, b| {
             if out.table.is_empty() {
-                out.table = vec![EMPTY_EV; table_size];
+                out.table = vec![(0, 0); table_size];
             }
-            let n: usize = parse_outs.iter().map(|o| o.ev.bucket(b)[0].len() + o.ev.bucket(b)[1].len()).sum();
+            // The bucket's copies from every thread, main part and spill.
+            let mut parts: [&[Ev]; 64] = [&[]; 64];
+            let mut nparts = 0;
+            for po in parse_outs {
+                for part in po.ev.bucket(b) {
+                    parts[nparts] = part;
+                    nparts += 1;
+                }
+            }
+            let n: usize = parts[..nparts].iter().map(|p| p.len()).sum();
             let size = (n * 2).next_power_of_two().max(16);
             let mask = size - 1;
             let table = &mut out.table[..size];
-            for po in parse_outs {
-                for part in po.ev.bucket(b) {
-                    for e in part {
-                        let mut i = fmix64(e.eid) as usize & mask;
-                        loop {
-                            let s = &mut table[i];
-                            if s.eid == 0 {
-                                *s = *e;
-                                break;
-                            }
-                            if s.eid == e.eid {
-                                if e.ingest < s.ingest {
-                                    *s = *e;
-                                }
-                                break;
-                            }
-                            i = (i + 1) & mask;
+            // A slot holds eid and tag = ingest << 32 | part << 26 | index;
+            // `filled` lists the slots in use, so only they are read and reset.
+            out.filled.clear();
+            for (pi, part) in parts[..nparts].iter().enumerate() {
+                for (j, e) in part.iter().enumerate() {
+                    let tag = (e.ingest as u64) << 32 | (pi as u64) << 26 | j as u64;
+                    let mut i = fmix64(e.eid) as usize & mask;
+                    loop {
+                        let s = &mut table[i];
+                        if s.0 == 0 {
+                            *s = (e.eid, tag);
+                            out.filled.push(i as u32);
+                            break;
                         }
+                        if s.0 == e.eid {
+                            if tag >> 32 < s.1 >> 32 {
+                                s.1 = tag;
+                            }
+                            break;
+                        }
+                        i = (i + 1) & mask;
                     }
                 }
             }
             // Survivors first, then their persons in one batch, then scatter.
             out.keys.clear();
             out.rest.clear();
-            for slot in table.iter_mut() {
-                if slot.uid != 0 {
-                    out.keys.push(slot.uid);
-                    out.rest.push((slot.ts, slot.pc));
+            for &i in &out.filled {
+                let tag = table[i as usize].1;
+                table[i as usize] = (0, 0);
+                let e = &parts[(tag >> 26 & 63) as usize][(tag & ((1 << 26) - 1)) as usize];
+                if e.uid != 0 {
+                    out.keys.push(e.uid);
+                    out.rest.push((e.ts, e.pc));
                 }
-                *slot = EMPTY_EV;
             }
             links.resolve(&mut out.keys, &mut out.maybe);
             for (&person, &(ts, pc)) in out.keys.iter().zip(&out.rest) {
@@ -1111,16 +1131,16 @@ fn parse_events(chunk: &'static [u8], ctx: &Ctx, shift: u32, out: &mut ParseOut)
     let (ws, we, t0) = (ctx.ws, ctx.we, ctx.t0);
     let ParseOut { ev, odd, .. } = out;
     csv::for_each_line::<7>(chunk, |l| {
-        let eid_s = l.get(0);
+        let (eid_s, eid_w) = l.get_w(0);
         if eid_s.is_empty() {
             return;
         }
-        let eid = ids::key(eid_s);
+        let eid = ids::key_w(eid_s, eid_w);
         let mut e = Ev { eid, uid: 0, ingest: u32::MAX, ts: 0, pc: 0, _pad: 0 };
         if let Some(ingest) = parse_ts(l.get(3)) {
             e.ingest = ctx.ingest_key(ingest);
             if let Some(t) = parse_ts(l.get(2)) {
-                let uid = l.get(1);
+                let (uid, uid_w) = l.get_w(1);
                 if t >= ws && t < we && ingest - t <= DAY && !uid.is_empty() {
                     let product = l.get(5);
                     let valid = !product.is_empty()
@@ -1137,7 +1157,7 @@ fn parse_events(chunk: &'static [u8], ctx: &Ctx, shift: u32, out: &mut ParseOut)
                             _ => false,
                         };
                     if valid {
-                        e.uid = ids::key_keep(uid, odd);
+                        e.uid = ids::key_keep_w(uid, uid_w, odd);
                         e.ts = (t - t0) as u32;
                     }
                 }
@@ -1154,7 +1174,7 @@ fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out:
     // lookups, prefetched a few ahead, since the links table is large.
     scratch.clear();
     csv::for_each_line::<4>(chunk, |l| {
-        let (id, user) = (l.get(0), l.get(1));
+        let ((id, id_w), (user, user_w)) = (l.get_w(0), l.get_w(1));
         if id.is_empty() || user.is_empty() {
             return;
         }
@@ -1170,7 +1190,7 @@ fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out:
             Some(c) => c,
             None => return,
         };
-        scratch.push(Ck { person: ids::key(user), id: ids::key_keep(id, odd), ts: (t - t0) as u32, camp });
+        scratch.push(Ck { person: ids::key_w(user, user_w), id: ids::key_keep_w(id, id_w, odd), ts: (t - t0) as u32, camp });
     });
     keys.clear();
     keys.extend(scratch.iter().map(|c| c.person));

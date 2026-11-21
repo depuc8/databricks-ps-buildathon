@@ -1,11 +1,11 @@
 //! IDs as u64 keys.
 //!
-//! An ID of 1 to 10 ASCII letters, digits and `_` (every ID the generator
-//! writes, campaign and product IDs too) packs exactly into 60 bits, 6 bits a
-//! character, left-aligned, with codes in ASCII order, so packed keys compare
-//! like the strings, byte by byte. Any other ID (spaces, tabs, `\r`, other
-//! punctuation, longer) is "odd": its key is the top bit plus a 63-bit hash,
-//! and its bytes are kept in a side table.
+//! An ID of 1 to 9 ASCII bytes other than NUL (every ID the generator writes,
+//! campaign and product IDs too) packs exactly into 63 bits, 7 bits a byte,
+//! first byte highest, so packed keys compare like the strings, byte by
+//! byte. Any other ID (longer, or with NUL or non-ASCII bytes) is "odd": its
+//! key is the top bit plus a 63-bit hash, and its bytes are kept in a side
+//! table.
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -16,54 +16,52 @@ pub const ODD: u64 = 1 << 63;
 
 pub type Odd = HashMap<u64, &'static [u8], BuildHasherDefault<Fx>>;
 
-const fn build_codes() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut c = 0;
-    let mut code = 1;
-    while c < 256 {
-        let b = c as u8;
-        if b.is_ascii_digit() || b.is_ascii_uppercase() || b == b'_' || b.is_ascii_lowercase() {
-            t[c] = code;
-            code += 1;
-        }
-        c += 1;
-    }
-    t
-}
-
-static CODES: [u8; 256] = build_codes();
-
-const fn build_chars() -> [u8; 64] {
-    let mut t = [0u8; 64];
-    let mut c = 0;
-    while c < 256 {
-        let code = CODES[c];
-        if code != 0 {
-            t[code as usize] = c as u8;
-        }
-        c += 1;
-    }
-    t
-}
-
-static CHARS: [u8; 64] = build_chars();
-
 #[inline]
 fn pack(s: &[u8]) -> Option<u64> {
-    if s.is_empty() || s.len() > 10 {
+    if s.is_empty() || s.len() > 9 {
         return None;
     }
     let mut v = 0u64;
-    let mut shift: u32 = 54;
+    let mut shift = 56;
     for &c in s {
-        let k = CODES[c as usize];
-        if k == 0 {
+        if c == 0 || c >= 0x80 {
             return None;
         }
-        v |= (k as u64) << shift;
-        shift = shift.wrapping_sub(6);
+        v |= (c as u64) << shift;
+        shift -= 7;
     }
     Some(v)
+}
+
+/// `pack` with PEXT.
+///
+/// # Safety
+/// 16 bytes from `s.as_ptr()` must be readable.
+#[cfg(target_feature = "bmi2")]
+#[inline(always)]
+unsafe fn pack_wide(s: &[u8]) -> Option<u64> {
+    use std::arch::x86_64::_pext_u64;
+    let n = s.len();
+    if n == 0 || n > 9 {
+        return None;
+    }
+    let p = s.as_ptr();
+    let keep = if n >= 8 { u64::MAX } else { !(u64::MAX >> (8 * n)) };
+    let a = u64::from_be_bytes((p as *const [u8; 8]).read_unaligned()) & keep;
+    let b = if n == 9 { *p.add(8) as u64 } else { 0 };
+    // ASCII, and no NUL inside: the first zero byte of `a` is at or past n.
+    let zero = a.wrapping_sub(0x0101_0101_0101_0101) & !a & 0x8080_8080_8080_8080;
+    let first_zero = (zero.leading_zeros() / 8) as usize;
+    if (a | b) & 0x8080_8080_8080_8080 != 0 || first_zero < n.min(8) || (n == 9 && b == 0) {
+        return None;
+    }
+    Some(_pext_u64(a, 0x7f7f_7f7f_7f7f_7f7f) << 7 | b)
+}
+
+#[cfg(not(target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn pack_wide(s: &[u8]) -> Option<u64> {
+    pack(s)
 }
 
 fn hash_odd(s: &[u8]) -> u64 {
@@ -77,6 +75,29 @@ fn hash_odd(s: &[u8]) -> u64 {
         b = crate::fmix64(b.wrapping_add(x) ^ 0x9e37_79b9_7f4a_7c15).wrapping_add(a);
     }
     ODD | ((a ^ b.rotate_left(29)) >> 1)
+}
+
+/// `key`, given whether 16 bytes from `s.as_ptr()` are readable.
+#[inline(always)]
+pub fn key_w(s: &[u8], wide: bool) -> u64 {
+    // SAFETY: the caller vouches for 16 readable bytes when `wide`.
+    match if wide { unsafe { pack_wide(s) } } else { pack(s) } {
+        Some(v) => v,
+        None => hash_odd(s),
+    }
+}
+
+/// `key_keep`, given whether 16 bytes from `s.as_ptr()` are readable.
+#[inline(always)]
+pub fn key_keep_w(s: &'static [u8], wide: bool, odd: &mut Vec<(u64, &'static [u8])>) -> u64 {
+    match if wide { unsafe { pack_wide(s) } } else { pack(s) } {
+        Some(v) => v,
+        None => {
+            let k = hash_odd(s);
+            odd.push((k, s));
+            k
+        }
+    }
 }
 
 /// The key of a non-empty ID whose bytes are never needed again.
@@ -106,12 +127,12 @@ pub fn bytes<'a>(k: u64, buf: &'a mut [u8; 10], odd: &Odd) -> &'a [u8] {
         return odd[&k];
     }
     let mut n = 0;
-    while n < 10 {
-        let code = (k >> (54 - 6 * n)) & 63;
-        if code == 0 {
+    while n < 9 {
+        let c = (k >> (56 - 7 * n)) & 0x7f;
+        if c == 0 {
             break;
         }
-        buf[n] = CHARS[code as usize];
+        buf[n] = c as u8;
         n += 1;
     }
     &buf[..n]
@@ -132,10 +153,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wide_packing_matches() {
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let pool = b"09azAZ_u1kc-. \r\t\"\x00\x7f\x80\xff";
+        for _ in 0..300_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let n = (seed % 12) as usize;
+            let mut buf = [0u8; 32];
+            for (i, b) in buf.iter_mut().enumerate() {
+                let r = seed.rotate_left(i as u32 * 5) as usize;
+                *b = if r % 4 == 0 { pool[r % pool.len()] } else { b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"[r % 63] };
+            }
+            let s = &buf[..n];
+            assert_eq!(unsafe { pack_wide(s) }, pack(s), "{s:?}");
+        }
+    }
+
+    #[test]
     fn packing_keeps_order_and_bytes() {
         let odd = Odd::default();
-        let words: [&[u8]; 13] =
-            [b"0", b"U1", b"u", b"u1", b"u10", b"u1a", b"u2", b"zzzzzzzzzz", b"A", b"c_1", b"c_10", b"cZ", b"ca"];
+        let words: [&[u8]; 16] = [
+            b"0", b"U1", b"u", b"u1", b"u10", b"u1a", b"u2", b"zzzzzzzzz", b"A", b"c_1", b"c_10", b"cZ", b"ca", b" u1",
+            b"u1 ", b"A\tB",
+        ];
         for a in words {
             let ka = pack(a).unwrap();
             let mut buf = [0u8; 10];
@@ -144,7 +186,7 @@ mod tests {
                 assert_eq!(ka.cmp(&pack(b).unwrap()), a.cmp(b), "{a:?} {b:?}");
             }
         }
-        for s in [&b" u1"[..], b"u1 ", b"u1\r", b"A\tB", b"user-id", b"abcdefghijk", "٢".as_bytes()] {
+        for s in [&b"abcdefghij"[..], b"user_id_ab", b"u1\0", "٢".as_bytes(), "u\u{e9}".as_bytes()] {
             assert!(pack(s).is_none());
             assert_ne!(key(s) & ODD, 0);
         }
