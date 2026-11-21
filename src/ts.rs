@@ -224,6 +224,26 @@ impl Fast {
         parse_ts(s).map(|t| t.div_euclid(1000))
     }
 
+    /// `secs` for an ingest_ts, which rules.md guarantees to be a valid F1:
+    /// one in the table's months skips the checks.
+    #[inline(always)]
+    pub fn ingest_secs(&self, s: &[u8]) -> Option<i64> {
+        if s.len() == 20 {
+            let a = load8(s, 0);
+            let hit = [a == self.keys[0], a == self.keys[1], a == self.keys[2], a == self.keys[3]];
+            if hit[0] | hit[1] | hit[2] | hit[3] {
+                let i = hit[1] as usize | (hit[2] as usize) << 1 | (hit[3] as usize) * 3;
+                let x = load8(s, 8); // DDTHH:MM
+                let pd = pairs(load8(s, 11), 0xffff_00ff_ff00_ffff); // HH:MM:SS
+                let day = (x & 0xf) * 10 + (x >> 8 & 0xf);
+                return Some(
+                    self.base[i] + (day * 86_400 + (pd & 0xff) * 3600 + (pd >> 24 & 0xff) * 60 + (pd >> 48 & 0xff)) as i64,
+                );
+            }
+        }
+        self.secs(s)
+    }
+
     /// `parse_ts`, given whether 16 bytes from `s.as_ptr()` are readable.
     #[inline(always)]
     pub fn ms(&self, s: &[u8], wide: bool) -> Option<i64> {
@@ -449,6 +469,9 @@ mod tests {
             assert_eq!(fast.ms(s, true), parse_ts(s), "{:?}", std::str::from_utf8(s));
             assert_eq!(fast.ms(s, false), parse_ts(s), "{:?}", std::str::from_utf8(s));
             assert_eq!(fast.secs(s), parse_ts(s).map(|v| v.div_euclid(1000)), "{:?}", std::str::from_utf8(s));
+            if fast.secs(s).is_some() && s.len() == 20 && s[19] == b'Z' {
+                assert_eq!(fast.ingest_secs(s), fast.secs(s), "{:?}", std::str::from_utf8(s));
+            }
         }
         assert_eq!(civil_from_days(days_from_civil(2028, 2, 29)), (2028, 2, 29));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));

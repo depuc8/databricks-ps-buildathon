@@ -1,13 +1,15 @@
 //! Writes user_daily/ and campaign_daily/ as Parquet, by hand: uncompressed
 //! data pages (v1) of PLAIN values, definition levels as one bit-packed run,
-//! and the footer in Thrift's compact protocol. Each file is built in memory
-//! and written in one call.
+//! and the footer in Thrift's compact protocol. user_daily values are kept
+//! per column as the rows come (`UserCols`), and each file goes out in one
+//! vectored write of page headers and column slices.
 
 use std::fs;
+use std::io::{IoSlice, Write};
 use std::path::Path;
 
 use crate::ids::{self, Odd};
-use crate::{CampStat, Ctx, PersonOut, UserRow};
+use crate::{CampStat, Ctx, PersonOut};
 
 /// Rows per data page.
 const PAGE_ROWS: usize = 1 << 16;
@@ -237,67 +239,152 @@ fn write_file(path: &Path, specs: &[ColumnSpec], columns: &[&dyn Values], rows: 
     fs::write(path, &file).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
-/// A required column computed from each row.
+/// A required column computed from each row: `f` writes at most `max`
+/// bytes for a row and returns how many it wrote.
 struct Fixed<'a, R, F> {
     rows: &'a [R],
+    max: usize,
     f: F,
 }
 
-impl<R, F: Fn(&R, &mut Vec<u8>)> Values for Fixed<'_, R, F> {
+impl<R, F: Fn(&R, *mut u8) -> usize> Values for Fixed<'_, R, F> {
     fn len(&self) -> usize {
         self.rows.len()
     }
     fn page(&self, a: usize, b: usize, out: &mut Vec<u8>) {
-        for r in &self.rows[a..b] {
-            (self.f)(r, out);
-        }
+        put_rows(out, &self.rows[a..b], self.max, &self.f);
     }
 }
 
-fn put_bytes(out: &mut Vec<u8>, v: &[u8]) {
-    out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-    out.extend_from_slice(v);
-}
-
-/// top_category is optional: a page holds its levels, then the present values.
-struct TopCategory<'a> {
-    rows: &'a [UserRow],
-    names: &'a [&'static [u8]],
-}
-
-impl Values for TopCategory<'_> {
-    fn len(&self) -> usize {
-        self.rows.len()
+/// Appends each row's bytes, written by `f` through a raw pointer into
+/// room for `max` bytes a row.
+#[inline(always)]
+fn put_rows<R>(out: &mut Vec<u8>, rows: &[R], max: usize, f: impl Fn(&R, *mut u8) -> usize) {
+    out.reserve(rows.len() * max);
+    let base = out.as_mut_ptr();
+    let mut len = out.len();
+    for r in rows {
+        len += f(r, unsafe { base.add(len) });
     }
-    fn page(&self, a: usize, b: usize, out: &mut Vec<u8>) {
-        let rows = &self.rows[a..b];
-        // Levels: one bit-packed run of ceil(n / 8) groups, after its byte length.
-        let groups = rows.len().div_ceil(8);
-        let mut levels = Vec::with_capacity(groups + 8);
-        let mut header = ((groups as u64) << 1) | 1;
-        while header >= 0x80 {
-            levels.push(header as u8 | 0x80);
-            header >>= 7;
+    // SAFETY: f wrote at most max bytes a row inside the reserved room.
+    unsafe { out.set_len(len) };
+}
+
+/// Writes v at p unaligned.
+#[inline(always)]
+unsafe fn put<const N: usize>(p: *mut u8, v: [u8; N]) -> usize {
+    (p as *mut [u8; N]).write_unaligned(v);
+    N
+}
+
+/// Writes a BYTE_ARRAY value (length, then bytes) at p.
+#[inline(always)]
+unsafe fn put_bytes(p: *mut u8, v: &[u8]) -> usize {
+    put(p, (v.len() as u32).to_le_bytes());
+    std::ptr::copy_nonoverlapping(v.as_ptr(), p.add(4), v.len());
+    4 + v.len()
+}
+
+/// Writes an ID as a BYTE_ARRAY value at p: at most 17 bytes, or 4 plus
+/// the length of an odd ID.
+#[inline(always)]
+unsafe fn put_id(p: *mut u8, k: u64, odd: &Odd) -> usize {
+    #[cfg(target_feature = "bmi2")]
+    if k & ids::ODD == 0 {
+        // The inverse of the packing: bytes 0..8 from bits 7..63, byte 8
+        // from bits 0..7. The bytes after the ID are zero.
+        let w = std::arch::x86_64::_pdep_u64(k >> 7, 0x7f7f_7f7f_7f7f_7f7f).swap_bytes();
+        let n8 = 8 - (w.leading_zeros() / 8) as usize;
+        let n = n8 + (n8 == 8 && k & 0x7f != 0) as usize;
+        put(p, (n as u32).to_le_bytes());
+        put(p.add(4), w.to_le_bytes());
+        *p.add(12) = (k & 0x7f) as u8;
+        return 4 + n;
+    }
+    let mut buf = [0u8; 10];
+    put_bytes(p, ids::bytes(k, &mut buf, odd))
+}
+
+/// One thread's user_daily rows as each column's PLAIN values, appended as
+/// the rows are made, while their data is in cache.
+#[derive(Default)]
+pub struct UserCols {
+    rows: usize,
+    id: Vec<u8>,
+    day: Vec<i32>,
+    sessions: Vec<i32>,
+    events: Vec<i32>,
+    revenue: Vec<i64>,
+    top: Vec<u8>,
+    /// Bit r: row r has a top_category.
+    present: Vec<u64>,
+    /// Where id and top stand at the start of each page.
+    id_pages: Vec<usize>,
+    top_pages: Vec<usize>,
+}
+
+impl UserCols {
+    pub fn len(&self) -> usize {
+        self.rows
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn push(&mut self, person: u64, day: i32, sessions: i64, events: i64, revenue: i64, top: Option<&[u8]>, odd: &Odd) {
+        if self.rows % PAGE_ROWS == 0 {
+            self.id_pages.push(self.id.len());
+            self.top_pages.push(self.top.len());
         }
-        levels.push(header as u8);
-        for g in rows.chunks(8) {
-            let mut byte = 0u8;
-            for (i, r) in g.iter().enumerate() {
-                byte |= ((r.top >= 0) as u8) << i;
+        if self.rows % 64 == 0 {
+            self.present.push(0);
+        }
+        if person & ids::ODD == 0 {
+            self.id.reserve(16);
+            // SAFETY: put_id writes 13 bytes for a packed ID.
+            unsafe {
+                let n = put_id(self.id.as_mut_ptr().add(self.id.len()), person, odd);
+                self.id.set_len(self.id.len() + n);
             }
-            levels.push(byte);
+        } else {
+            let v = odd[&person];
+            self.id.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            self.id.extend_from_slice(v);
         }
-        out.extend_from_slice(&(levels.len() as u32).to_le_bytes());
-        out.extend_from_slice(&levels);
-        for r in rows {
-            if r.top >= 0 {
-                put_bytes(out, self.names[r.top as usize]);
-            }
+        self.day.push(day);
+        self.sessions.push(sessions as i32);
+        self.events.push(events as i32);
+        self.revenue.push(revenue);
+        if let Some(name) = top {
+            *self.present.last_mut().unwrap() |= 1 << (self.rows % 64);
+            self.top.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            self.top.extend_from_slice(name);
+        }
+        self.rows += 1;
+    }
+}
+
+/// The bytes of a slice of plain numbers (little-endian, as Parquet wants).
+fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: i32 and i64 have no padding; x86-64 is little-endian.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// Part of a file: bytes made for it, or a slice of a column.
+enum Piece<'a> {
+    Own(Vec<u8>),
+    Ref(&'a [u8]),
+}
+
+impl Piece<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Piece::Own(v) => v,
+            Piece::Ref(s) => s,
         }
     }
 }
 
-fn user_file(path: &Path, rows: &[UserRow], ctx: &Ctx, odd: &Odd) {
+fn user_file(path: &Path, cols: &UserCols) {
     let specs = [
         ColumnSpec { name: "user_id", ty: BYTE_ARRAY, optional: false, logical: Logical::String },
         ColumnSpec { name: "day", ty: INT32, optional: false, logical: Logical::Date },
@@ -306,19 +393,63 @@ fn user_file(path: &Path, rows: &[UserRow], ctx: &Ctx, odd: &Odd) {
         ColumnSpec { name: "revenue_cents", ty: INT64, optional: false, logical: Logical::None },
         ColumnSpec { name: "top_category", ty: BYTE_ARRAY, optional: true, logical: Logical::String },
     ];
-    let user_id = Fixed {
-        rows,
-        f: |r: &UserRow, out: &mut Vec<u8>| {
-            let mut buf = [0u8; 10];
-            put_bytes(out, ids::bytes(r.person, &mut buf, odd));
-        },
-    };
-    let day = Fixed { rows, f: |r: &UserRow, out: &mut Vec<u8>| out.extend_from_slice(&r.day.to_le_bytes()) };
-    let sessions = Fixed { rows, f: |r: &UserRow, out: &mut Vec<u8>| out.extend_from_slice(&(r.sessions as i32).to_le_bytes()) };
-    let events = Fixed { rows, f: |r: &UserRow, out: &mut Vec<u8>| out.extend_from_slice(&(r.events as i32).to_le_bytes()) };
-    let revenue = Fixed { rows, f: |r: &UserRow, out: &mut Vec<u8>| out.extend_from_slice(&r.revenue.to_le_bytes()) };
-    let top = TopCategory { rows, names: &ctx.categories };
-    write_file(path, &specs, &[&user_id, &day, &sessions, &events, &revenue, &top], rows.len());
+    let rows = cols.rows;
+    let pages = rows.div_ceil(PAGE_ROWS);
+    // The byte range of page p of a column given its page starts.
+    let range = |starts: &[usize], end: usize, p: usize| starts[p]..if p + 1 < pages { starts[p + 1] } else { end };
+    let mut pieces: Vec<Piece> = vec![Piece::Ref(b"PAR1")];
+    let mut pos = 4;
+    let mut done = Vec::new();
+    for c in 0..if rows > 0 { specs.len() } else { 0 } {
+        let offset = pos;
+        for p in 0..pages {
+            let (a, b) = (p * PAGE_ROWS, ((p + 1) * PAGE_ROWS).min(rows));
+            let mut data: Vec<Piece> = Vec::new();
+            match c {
+                0 => data.push(Piece::Ref(&cols.id[range(&cols.id_pages, cols.id.len(), p)])),
+                1 => data.push(Piece::Ref(bytes_of(&cols.day[a..b]))),
+                2 => data.push(Piece::Ref(bytes_of(&cols.sessions[a..b]))),
+                3 => data.push(Piece::Ref(bytes_of(&cols.events[a..b]))),
+                4 => data.push(Piece::Ref(bytes_of(&cols.revenue[a..b]))),
+                _ => {
+                    // Levels: one bit-packed run of ceil(n / 8) groups, after
+                    // its byte length. Pages start on a word of `present`.
+                    let groups = (b - a).div_ceil(8);
+                    let mut levels = Vec::with_capacity(groups + 16);
+                    let mut header = ((groups as u64) << 1) | 1;
+                    let mut run = Vec::new();
+                    while header >= 0x80 {
+                        run.push(header as u8 | 0x80);
+                        header >>= 7;
+                    }
+                    run.push(header as u8);
+                    levels.extend_from_slice(&((run.len() + groups) as u32).to_le_bytes());
+                    levels.extend_from_slice(&run);
+                    levels.extend_from_slice(&bytes_of(&cols.present[a / 64..b.div_ceil(64)])[..groups]);
+                    data.push(Piece::Own(levels));
+                    data.push(Piece::Ref(&cols.top[range(&cols.top_pages, cols.top.len(), p)]));
+                }
+            }
+            let size: usize = data.iter().map(|d| d.bytes().len()).sum();
+            let header = page_header(b - a, size);
+            pos += header.len() + size;
+            pieces.push(Piece::Own(header));
+            pieces.extend(data);
+        }
+        done.push(ColumnDone { offset, size: pos - offset, values: rows });
+    }
+    let mut tail = Vec::new();
+    footer(&mut tail, &specs, &done, rows);
+    pieces.push(Piece::Own(tail));
+
+    let mut file = fs::File::create(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut slices: Vec<IoSlice> = pieces.iter().map(|p| IoSlice::new(p.bytes())).collect();
+    let mut rest = &mut slices[..];
+    while !rest.is_empty() {
+        let n = file.write_vectored(rest).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(n > 0, "{}: short write", path.display());
+        IoSlice::advance_slices(&mut rest, n);
+    }
 }
 
 struct CampRow {
@@ -338,17 +469,19 @@ fn campaign_file(path: &Path, rows: &[CampRow]) {
         ColumnSpec { name: "revenue_cents", ty: INT64, optional: false, logical: Logical::None },
         ColumnSpec { name: "assisted_sessions", ty: INT64, optional: false, logical: Logical::None },
     ];
-    let id = Fixed { rows, f: |r: &CampRow, out: &mut Vec<u8>| put_bytes(out, r.id) };
-    let channel = Fixed { rows, f: |r: &CampRow, out: &mut Vec<u8>| put_bytes(out, r.channel) };
-    let day = Fixed { rows, f: |r: &CampRow, out: &mut Vec<u8>| out.extend_from_slice(&r.day.to_le_bytes()) };
-    let sessions = Fixed { rows, f: |r: &CampRow, out: &mut Vec<u8>| out.extend_from_slice(&r.stat.sessions.to_le_bytes()) };
-    let purchasing = Fixed { rows, f: |r: &CampRow, out: &mut Vec<u8>| out.extend_from_slice(&r.stat.purchasing.to_le_bytes()) };
-    let revenue = Fixed { rows, f: |r: &CampRow, out: &mut Vec<u8>| out.extend_from_slice(&r.stat.revenue.to_le_bytes()) };
-    let assisted = Fixed { rows, f: |r: &CampRow, out: &mut Vec<u8>| out.extend_from_slice(&r.stat.assisted.to_le_bytes()) };
+    let id_max = 4 + rows.iter().map(|r| r.id.len()).max().unwrap_or(0);
+    let channel_max = 4 + rows.iter().map(|r| r.channel.len()).max().unwrap_or(0);
+    let id = Fixed { rows, max: id_max, f: |r: &CampRow, p: *mut u8| unsafe { put_bytes(p, r.id) } };
+    let channel = Fixed { rows, max: channel_max, f: |r: &CampRow, p: *mut u8| unsafe { put_bytes(p, r.channel) } };
+    let day = Fixed { rows, max: 4, f: |r: &CampRow, p: *mut u8| unsafe { put(p, r.day.to_le_bytes()) } };
+    let sessions = Fixed { rows, max: 8, f: |r: &CampRow, p: *mut u8| unsafe { put(p, r.stat.sessions.to_le_bytes()) } };
+    let purchasing = Fixed { rows, max: 8, f: |r: &CampRow, p: *mut u8| unsafe { put(p, r.stat.purchasing.to_le_bytes()) } };
+    let revenue = Fixed { rows, max: 8, f: |r: &CampRow, p: *mut u8| unsafe { put(p, r.stat.revenue.to_le_bytes()) } };
+    let assisted = Fixed { rows, max: 8, f: |r: &CampRow, p: *mut u8| unsafe { put(p, r.stat.assisted.to_le_bytes()) } };
     write_file(path, &specs, &[&id, &channel, &day, &sessions, &purchasing, &revenue, &assisted], rows.len());
 }
 
-pub fn write_all(out: &Path, ctx: &Ctx, odd: &Odd, parts: &mut [PersonOut]) {
+pub fn write_all(out: &Path, ctx: &Ctx, parts: &mut [PersonOut]) {
     let user_dir = out.join("user_daily");
     let camp_dir = out.join("campaign_daily");
     fs::create_dir_all(&user_dir).expect("mkdir user_daily");
@@ -359,13 +492,13 @@ pub fn write_all(out: &Path, ctx: &Ctx, odd: &Odd, parts: &mut [PersonOut]) {
         let last = parts.len().saturating_sub(1);
         let mut wrote_any = false;
         for (i, p) in parts.iter().enumerate() {
-            if p.users.is_empty() && (wrote_any || i < last) {
+            if p.users.len() == 0 && (wrote_any || i < last) {
                 continue;
             }
             wrote_any = true;
             let path = user_dir.join(format!("part-{i:05}.parquet"));
-            let rows = &p.users[..];
-            sc.spawn(move || user_file(&path, rows, ctx, odd));
+            let cols = &p.users;
+            sc.spawn(move || user_file(&path, cols));
         }
 
         // Campaign stats are summed over threads; one small file.
@@ -392,4 +525,27 @@ pub fn write_all(out: &Path, ctx: &Ctx, odd: &Odd, parts: &mut [PersonOut]) {
         }
         campaign_file(&camp_dir.join("part-00000.parquet"), &rows);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn put_id_matches_bytes() {
+        let odd = Odd::default();
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..100_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let n = 1 + (seed % 9) as usize;
+            let id: Vec<u8> = (0..n).map(|i| 1 + (seed.rotate_left(7 * i as u32) % 127) as u8).collect();
+            let k = ids::key(&id);
+            let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
+            let na = unsafe { put_id(a.as_mut_ptr(), k, &odd) };
+            let nb = unsafe { put_bytes(b.as_mut_ptr(), &id) };
+            assert_eq!(&a[..na], &b[..nb], "{id:?}");
+        }
+    }
 }

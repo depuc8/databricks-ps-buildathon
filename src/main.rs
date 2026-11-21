@@ -330,13 +330,13 @@ struct Ck {
     camp: u32,
 }
 
-pub struct UserRow {
-    pub person: u64,
-    pub day: i32,
-    pub sessions: i64,
-    pub events: i64,
-    pub revenue: i64,
-    pub top: i32,
+/// The user_daily row being counted.
+struct UserRow {
+    person: u64,
+    day: i32,
+    sessions: i64,
+    events: i64,
+    revenue: i64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -762,7 +762,7 @@ struct DedupOut {
 }
 
 pub struct PersonOut {
-    pub users: Vec<UserRow>,
+    pub users: output::UserCols,
     pub credit: Vec<Credit>,
     pub assisted: Vec<u32>,
     sess: Vec<Session>,
@@ -918,6 +918,29 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
         .clamp(1, 32);
 
+    // The input files are listed, mapped and cut into chunks meanwhile.
+    let files = {
+        let data = data.clone();
+        std::thread::spawn(move || {
+            let link_files = csv_files(&data.join("links"));
+            let mut ev_chunks = Vec::new();
+            let mut ev_bytes = 0usize;
+            for p in csv_files(&data.join("events")) {
+                let b = body(leak_read(&p));
+                ev_bytes += b.len();
+                chunks(b, CHUNK, &mut ev_chunks);
+            }
+            let mut ck_chunks = Vec::new();
+            let mut ck_bytes = 0usize;
+            for p in csv_files(&data.join("clicks")) {
+                let b = body(leak_read(&p));
+                ck_bytes += b.len();
+                chunks(b, CLICK_CHUNK, &mut ck_chunks);
+            }
+            (link_files, ev_chunks, ev_bytes, ck_chunks, ck_bytes)
+        })
+    };
+
     // ---- small inputs
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let ws = manifest_ts(&manifest, "window_start");
@@ -929,21 +952,32 @@ fn main() {
 
     let mut f2: [&'static [u8]; 2] = [&[]; 2];
     let mut product_rows: Vec<(&'static [u8], &'static [u8])> = Vec::new();
-    for_lines(body(leak_read(&data.join("products.csv"))), |line| {
-        if split(line, &mut f2) {
-            product_rows.push((f2[0], f2[1]));
-        }
-    });
-    let mut categories: Vec<&'static [u8]> = product_rows.iter().map(|r| r.1).collect();
-    categories.push(b"unknown");
+    csv::for_each::<2>(body(leak_read(&data.join("products.csv"))), |f| product_rows.push((f[0], f[1])));
+    // Categories are indexed in byte-wise order, so a smaller index wins a
+    // top_category tie.
+    let mut cat_index: FxMap<&'static [u8], u32> = FxMap::default();
+    cat_index.insert(b"unknown", 0);
+    for &(_, c) in &product_rows {
+        cat_index.entry(c).or_insert(0);
+    }
+    let mut categories: Vec<&'static [u8]> = cat_index.keys().copied().collect();
     categories.sort_unstable();
-    categories.dedup();
     assert!(categories.len() < 256, "too many categories");
-    let cat_index: FxMap<&[u8], u32> = categories.iter().enumerate().map(|(i, c)| (*c, i as u32)).collect();
+    for (i, c) in categories.iter().enumerate() {
+        cat_index.insert(c, i as u32);
+    }
     let unknown_cat = cat_index[&b"unknown"[..]];
+    // Packed product keys go to product_keys, odd ones (and empty) to
+    // products. The first row of a product wins.
     let mut products: FxMap<&'static [u8], u32> = FxMap::default();
-    for (p, c) in &product_rows {
-        products.entry(p).or_insert(cat_index[c]);
+    let mut product_keys = U64Map::with_capacity(product_rows.len());
+    for &(p, c) in &product_rows {
+        let k = if p.is_empty() { ids::ODD } else { ids::key(p) };
+        if k & ids::ODD == 0 {
+            product_keys.get_or_insert(k, cat_index[c] as u64);
+        } else {
+            products.entry(p).or_insert(cat_index[c]);
+        }
     }
 
     let mut campaign_ids = Vec::new();
@@ -957,12 +991,6 @@ fn main() {
         }
     });
 
-    let mut product_keys = U64Map::with_capacity(products.len());
-    for (p, &c) in &products {
-        if !p.is_empty() {
-            product_keys.get_or_insert(ids::key(p), c as u64);
-        }
-    }
     let mut campaign_keys = U64Map::with_capacity(campaigns.len());
     for (c, &i) in &campaigns {
         if !c.is_empty() {
@@ -989,21 +1017,7 @@ fn main() {
     let ctx = &ctx;
 
     // ---- parse: links on one thread, events and then clicks on all
-    let link_files = csv_files(&data.join("links"));
-    let mut ev_chunks = Vec::new();
-    let mut ev_bytes = 0usize;
-    for p in csv_files(&data.join("events")) {
-        let b = body(leak_read(&p));
-        ev_bytes += b.len();
-        chunks(b, CHUNK, &mut ev_chunks);
-    }
-    let mut ck_chunks = Vec::new();
-    let mut ck_bytes = 0usize;
-    for p in csv_files(&data.join("clicks")) {
-        let b = body(leak_read(&p));
-        ck_bytes += b.len();
-        chunks(b, CLICK_CHUNK, &mut ck_chunks);
-    }
+    let (link_files, ev_chunks, ev_bytes, ck_chunks, ck_bytes) = files.join().expect("file listing");
     let n_ev_chunks = ev_chunks.len();
 
     // Event lines average about 77 bytes and click lines about 47.
@@ -1151,7 +1165,7 @@ fn main() {
     let ncat = ctx.categories.len();
     let mut person_outs: Vec<PersonOut> = (0..nthreads)
         .map(|_| PersonOut {
-            users: Vec::new(),
+            users: output::UserCols::default(),
             credit: vec![Credit::default(); (ctx.organic() + 1) * ndays],
             assisted: vec![0; (ctx.organic() + 1) * ndays],
             sess: Vec::new(),
@@ -1172,7 +1186,7 @@ fn main() {
             for p in 0..g.persons.len() {
                 let evs = &g.evs[g.starts[p] as usize..g.starts[p + 1] as usize];
                 let cks = &g.cks[g.ck_starts[p] as usize..g.ck_starts[p + 1] as usize];
-                process_person(ctx, g.persons[p], evs, cks, out);
+                process_person(ctx, g.persons[p], evs, cks, odd, out);
             }
             out.group = g;
         });
@@ -1182,7 +1196,7 @@ fn main() {
     std::thread::spawn(move || drop((dedup_outs, parse_outs)));
 
     // ---- write
-    output::write_all(&out_dir, ctx, &odd, &mut person_outs);
+    output::write_all(&out_dir, ctx, &mut person_outs);
     eprintln!("done: {:?}", t_start.elapsed());
     // Skip freeing the big allocations.
     std::process::exit(0);
@@ -1213,7 +1227,7 @@ impl csv::Sink for EventSink<'_> {
         }
         let eid = ids::key_w(eid_s, eid_w);
         let mut e = Ev { eid, uid: 0, ingest: u32::MAX, ts: 0, pc: 0, _pad: 0 };
-        if let Some(ingest) = ctx.fast.secs(l.get(3)) {
+        if let Some(ingest) = ctx.fast.ingest_secs(l.get(3)) {
             e.ingest = ctx.ingest_key(ingest);
             let (ts, ts_w) = l.get_w(2);
             if let Some(t) = ctx.fast.ms(ts, ts_w) {
@@ -1292,27 +1306,27 @@ impl csv::Sink for ClickSink<'_> {
     }
 }
 
-fn process_person(ctx: &Ctx, person: u64, evs: &[Pe], cks: &[Ck], out: &mut PersonOut) {
+fn process_person(ctx: &Ctx, person: u64, evs: &[Pe], cks: &[Ck], odd: &Odd, out: &mut PersonOut) {
     let nd = ctx.ndays;
     let organic = ctx.organic();
     out.sess.clear();
-    let mut row = UserRow { person, day: -1, sessions: 0, events: 0, revenue: 0, top: -1 };
+    let mut row = UserRow { person, day: -1, sessions: 0, events: 0, revenue: 0 };
     let mut cur_day = u32::MAX;
     let mut prev = 0u32;
 
-    let flush = |row: &UserRow, catsum: &mut [u64], users: &mut Vec<UserRow>| {
-        let mut top = -1i32;
+    let flush = |row: &UserRow, catsum: &mut [u64], users: &mut output::UserCols| {
+        let mut top = None;
         if row.revenue > 0 {
             let mut best = 0u64;
             for (c, s) in catsum.iter_mut().enumerate() {
                 if *s > best {
                     best = *s;
-                    top = c as i32;
+                    top = Some(ctx.categories[c]);
                 }
                 *s = 0;
             }
         }
-        users.push(UserRow { top, ..*row });
+        users.push(row.person, row.day, row.sessions, row.events, row.revenue, top, odd);
     };
 
     for e in evs {
@@ -1323,14 +1337,7 @@ fn process_person(ctx: &Ctx, person: u64, evs: &[Pe], cks: &[Ck], out: &mut Pers
                     flush(&row, &mut out.catsum, &mut out.users);
                 }
                 cur_day = d;
-                row = UserRow {
-                    person,
-                    day: (ctx.day0 + d as i64) as i32,
-                    sessions: 0,
-                    events: 0,
-                    revenue: 0,
-                    top: -1,
-                };
+                row = UserRow { person, day: (ctx.day0 + d as i64) as i32, sessions: 0, events: 0, revenue: 0 };
             }
             out.sess.push(Session { start: e.ts, day: d, revenue: 0, purchase: false });
             row.sessions += 1;
