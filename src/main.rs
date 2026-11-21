@@ -1322,9 +1322,9 @@ impl csv::Sink for EventSink<'_> {
                 if t >= ctx.ws && t < ctx.we && ingest * 1000 - t <= DAY && !uid.is_empty() {
                     let (product, product_w) = l.get_w(5);
                     let valid = !product.is_empty()
-                        && match l.get(4) {
-                            b"view" | b"cart" => true,
-                            b"purchase" => match parse_price(l.get(6)) {
+                        && match event_type(l.get(4)) {
+                            VIEW_OR_CART => true,
+                            PURCHASE => match parse_price(l.get(6)) {
                                 Some(p) => {
                                     let cat = ctx.category(product, product_w);
                                     e.pc = p | cat << 24;
@@ -1342,6 +1342,23 @@ impl csv::Sink for EventSink<'_> {
             }
         }
         self.pending.push(self.ev, bucket_of(eid, self.shift), e);
+    }
+}
+
+const VIEW_OR_CART: u8 = 1;
+const PURCHASE: u8 = 2;
+
+/// VIEW_OR_CART, PURCHASE or 0 for an event_type, by one compare of its
+/// bytes as a number.
+#[inline(always)]
+fn event_type(t: &[u8]) -> u8 {
+    match t.len() {
+        4 => {
+            let v = u32::from_le_bytes(t.try_into().unwrap());
+            (v == u32::from_le_bytes(*b"view") || v == u32::from_le_bytes(*b"cart")) as u8
+        }
+        8 => 2 * (u64::from_le_bytes(t.try_into().unwrap()) == u64::from_le_bytes(*b"purchase")) as u8,
+        _ => 0,
     }
 }
 
