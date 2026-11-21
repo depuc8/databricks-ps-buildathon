@@ -446,6 +446,7 @@ struct ParseOut {
     ev: Arena<Ev>,
     ck: Arena<Ck>,
     odd: Vec<(u64, &'static [u8])>,
+    scratch: Vec<Ck>,
 }
 
 struct DedupOut {
@@ -692,6 +693,7 @@ fn main() {
             ev: Arena::new(nb_ev, per(est_ev, nb_ev)),
             ck: Arena::new(nb_p, per(est_ck, nb_p)),
             odd: Vec::new(),
+            scratch: Vec::new(),
         })
         .collect();
     let t_parse = Instant::now();
@@ -816,30 +818,34 @@ fn main() {
 fn parse_events(chunk: &'static [u8], ctx: &Ctx, shift: u32, out: &mut ParseOut) {
     let (ws, we, t0) = (ctx.ws, ctx.we, ctx.t0);
     let ParseOut { ev, odd, .. } = out;
-    csv::for_each::<7>(chunk, |f| {
-        if f[0].is_empty() {
+    csv::for_each_line::<7>(chunk, |l| {
+        let eid_s = l.get(0);
+        if eid_s.is_empty() {
             return;
         }
-        let eid = ids::key(f[0]);
+        let eid = ids::key(eid_s);
         let mut e = Ev { eid, uid: 0, ingest: u32::MAX, ts: 0, pc: 0, _pad: 0 };
-        if let Some(ingest) = parse_ts(f[3]) {
+        if let Some(ingest) = parse_ts(l.get(3)) {
             e.ingest = ctx.ingest_key(ingest);
-            if let Some(t) = parse_ts(f[2]) {
-                if t >= ws && t < we && ingest - t <= DAY && !f[1].is_empty() && !f[5].is_empty() {
-                    let valid = match f[4] {
-                        b"view" | b"cart" => true,
-                        b"purchase" => match parse_price(f[6]) {
-                            Some(p) => {
-                                let cat = *ctx.products.get(f[5]).unwrap_or(&ctx.unknown_cat);
-                                e.pc = p | cat << 24;
-                                true
-                            }
-                            None => false,
-                        },
-                        _ => false,
-                    };
+            if let Some(t) = parse_ts(l.get(2)) {
+                let uid = l.get(1);
+                if t >= ws && t < we && ingest - t <= DAY && !uid.is_empty() {
+                    let product = l.get(5);
+                    let valid = !product.is_empty()
+                        && match l.get(4) {
+                            b"view" | b"cart" => true,
+                            b"purchase" => match parse_price(l.get(6)) {
+                                Some(p) => {
+                                    let cat = *ctx.products.get(product).unwrap_or(&ctx.unknown_cat);
+                                    e.pc = p | cat << 24;
+                                    true
+                                }
+                                None => false,
+                            },
+                            _ => false,
+                        };
                     if valid {
-                        e.uid = ids::key_keep(f[1], odd);
+                        e.uid = ids::key_keep(uid, odd);
                         e.ts = (t - t0) as u32;
                     }
                 }
@@ -851,23 +857,34 @@ fn parse_events(chunk: &'static [u8], ctx: &Ctx, shift: u32, out: &mut ParseOut)
 
 fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out: &mut ParseOut) {
     let (we, t0) = (ctx.we, ctx.t0);
-    let ParseOut { ck, odd, .. } = out;
-    csv::for_each::<4>(chunk, |f| {
-        if f[0].is_empty() || f[1].is_empty() {
+    let ParseOut { ck, odd, scratch, .. } = out;
+    // First the clicks with their user_id key in `person`; then the person
+    // lookups, prefetched a few ahead, since the links table is large.
+    scratch.clear();
+    csv::for_each_line::<4>(chunk, |l| {
+        let (id, user) = (l.get(0), l.get(1));
+        if id.is_empty() || user.is_empty() {
             return;
         }
-        let t = match parse_ts(f[3]) {
+        let t = match parse_ts(l.get(3)) {
             Some(t) if t >= t0 && t < we => t,
             _ => return,
         };
-        let camp = match ctx.campaigns.get(f[2]) {
+        let camp = match ctx.campaigns.get(l.get(2)) {
             Some(&c) => c,
             None => return,
         };
-        let person = links.person(ids::key(f[1]));
-        let id = ids::key_keep(f[0], odd);
-        ck.push(bucket_of(person, shift), Ck { person, id, ts: (t - t0) as u32, camp });
+        scratch.push(Ck { person: ids::key(user), id: ids::key_keep(id, odd), ts: (t - t0) as u32, camp });
     });
+    const AHEAD: usize = 16;
+    for i in 0..scratch.len() {
+        if i + AHEAD < scratch.len() {
+            links.map.prefetch(scratch[i + AHEAD].person);
+        }
+        let mut c = scratch[i];
+        c.person = links.person(c.person);
+        ck.push(bucket_of(c.person, shift), c);
+    }
 }
 
 fn process_person(ctx: &Ctx, person: u64, evs: &[Pe], cks: &[Ck], out: &mut PersonOut) {

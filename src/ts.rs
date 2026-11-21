@@ -10,7 +10,7 @@ fn digit(c: u8) -> Option<i64> {
     }
 }
 
-pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let yoe = year - era * 400;
@@ -18,18 +18,40 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
 }
 
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        2 => {
-            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-                29
-            } else {
-                28
-            }
-        }
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
+const YEAR0: i64 = 1970;
+const YEARS: usize = 131;
+
+/// Days from the epoch to January 1 of each year from 1970 to 2100.
+static YEAR_DAYS: [i32; YEARS] = {
+    let mut t = [0i32; YEARS];
+    let mut i = 0;
+    while i < YEARS {
+        t[i] = days_from_civil(YEAR0 + i as i64, 1, 1) as i32;
+        i += 1;
     }
+    t
+};
+
+/// Days before each month (1-based), in common and leap years.
+static MONTH_DAYS: [[i32; 13]; 2] = [
+    [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334],
+    [0, 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335],
+];
+
+/// Days from the epoch for a valid date.
+#[inline(always)]
+fn days(year: i64, month: i64, day: i64, leap: bool) -> i64 {
+    let y = year - YEAR0;
+    if (0..YEARS as i64).contains(&y) {
+        YEAR_DAYS[y as usize] as i64 + MONTH_DAYS[leap as usize][month as usize] as i64 + day - 1
+    } else {
+        days_from_civil(year, month, day)
+    }
+}
+
+#[inline(always)]
+fn is_leap(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 #[inline(always)]
@@ -57,7 +79,7 @@ fn pairs(w: u64, mask: u64) -> u64 {
 
 /// Milliseconds since the epoch, or None for a bad timestamp. An F3 value too
 /// large for i64 is None too: it is outside every window anyway.
-#[inline]
+#[inline(always)]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
     let n = s.len();
     if (n == 20 || n == 25) && s[4] == b'-' {
@@ -80,7 +102,7 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
 }
 
 /// F1 `YYYY-MM-DDTHH:MM:SSZ` or F2 `YYYY-MM-DDTHH:MM:SS+HH:MM`.
-#[inline]
+#[inline(always)]
 fn parse_iso(s: &[u8]) -> Option<i64> {
     // Little-endian: byte 0 of each word is its first character.
     let a = load8(s, 0); // YYYY-MM-
@@ -107,10 +129,19 @@ fn parse_iso(s: &[u8]) -> Option<i64> {
     let hour = ((pb >> 24) & 0xff) as i64;
     let minute = ((pb >> 48) & 0xff) as i64;
     let second = ((pc >> 40) & 0xff) as i64;
-    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) || hour > 23 || minute > 59 || second > 59 {
+    if !(1..=12).contains(&month) || day < 1 || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-    let mut t = ((days_from_civil(year, month, day) * 24 + hour) * 60 + minute) * 60 + second;
+    let leap = is_leap(year);
+    let month_len = match month {
+        2 => 28 + leap as i64,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day > month_len {
+        return None;
+    }
+    let mut t = ((days(year, month, day, leap) * 24 + hour) * 60 + minute) * 60 + second;
     let zone = (c >> 56) as u8;
     if s.len() == 20 {
         if zone != b'Z' {

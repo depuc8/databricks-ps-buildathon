@@ -75,9 +75,32 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     (s, n, q)
 }
 
-/// Calls `f` with the N values of every well-formed line in `chunk`. N <= 15.
+/// One well-formed line: field i is `get(i)`, unquoted.
+pub struct Line<'a> {
+    chunk: &'static [u8],
+    start: usize,
+    ends: &'a [usize; 16],
+    quoted: bool,
+}
+
+impl Line<'_> {
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> &'static [u8] {
+        let s = if i == 0 { self.start } else { self.ends[i - 1] + 1 };
+        let e = self.ends[i];
+        // SAFETY: start <= s <= e <= chunk.len() for every field of a line.
+        let f = unsafe { self.chunk.get_unchecked(s..e) };
+        if self.quoted && f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' {
+            unsafe { f.get_unchecked(1..f.len() - 1) }
+        } else {
+            f
+        }
+    }
+}
+
+/// Calls `f` with every well-formed line of N fields in `chunk`. N <= 15.
 #[inline(always)]
-pub fn for_each<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&[&'static [u8]; N])) {
+pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&Line)) {
     let len = chunk.len();
     let base = chunk.as_ptr();
     // ends[i] is where field i ends; field i starts after ends[i-1] (or at line_start).
@@ -87,37 +110,25 @@ pub fn for_each<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&[&'stat
     let mut q_before = 0usize; // quotes before the current block
     let mut q_line = 0usize; // quotes before line_start
     let mut tail = [0u8; 64];
-    let mut out: [&'static [u8]; N] = [&[]; N];
 
     let mut emit = |line_start: usize, nfields: usize, ends: &[usize; 16], quotes: usize| {
         if nfields != N {
             return;
         }
-        let mut start = line_start;
-        if quotes == 0 {
-            for i in 0..N {
-                // SAFETY: start <= ends[i] <= len.
-                out[i] = unsafe { std::slice::from_raw_parts(base.add(start), ends[i] - start) };
-                start = ends[i] + 1;
-            }
-        } else {
+        if quotes != 0 {
             let mut wrapped = 0;
-            for i in 0..N {
-                let mut s = start;
-                let mut e = ends[i];
+            let mut s = line_start;
+            for &e in &ends[..N] {
                 if e - s >= 2 && chunk[s] == b'"' && chunk[e - 1] == b'"' {
-                    s += 1;
-                    e -= 1;
                     wrapped += 2;
                 }
-                out[i] = &chunk[s..e];
-                start = ends[i] + 1;
+                s = e + 1;
             }
             if wrapped != quotes {
                 return;
             }
         }
-        f(&out);
+        f(&Line { chunk, start: line_start, ends, quoted: quotes != 0 });
     };
 
     let mut b = 0;
@@ -155,6 +166,12 @@ pub fn for_each<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&[&'stat
         }
         emit(line_start, nsep + 1, &ends, q_before - q_line);
     }
+}
+
+/// Calls `f` with the N values of every well-formed line in `chunk`. N <= 15.
+#[inline(always)]
+pub fn for_each<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&[&'static [u8]; N])) {
+    for_each_line::<N>(chunk, |line| f(&std::array::from_fn(|i| line.get(i))));
 }
 
 #[cfg(test)]
@@ -200,6 +217,77 @@ mod tests {
             }
         }
         rows
+    }
+
+    fn scan_n<const N: usize>(text: &'static [u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut rows = Vec::new();
+        for_each::<N>(text, |f| rows.push(f.iter().map(|v| v.to_vec()).collect()));
+        rows
+    }
+
+    fn by_lines_n<const N: usize>(text: &'static [u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut rows = Vec::new();
+        let mut f: [&[u8]; N] = [&[]; N];
+        let mut lines: Vec<&'static [u8]> = text.split(|&c| c == b'\n').collect();
+        if text.ends_with(b"\n") || text.is_empty() {
+            lines.pop();
+        }
+        for line in lines {
+            if split(line, &mut f) {
+                rows.push(f.iter().map(|v| v.to_vec()).collect());
+            }
+        }
+        rows
+    }
+
+    /// Random text in the dialect's corner cases, against the line splitter.
+    #[test]
+    fn scan_fuzz() {
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for case in 0..3000 {
+            let mut t: Vec<u8> = Vec::new();
+            let lines = 1 + rnd(if case % 50 == 0 { 3000 } else { 40 });
+            for _ in 0..lines {
+                let fields = match rnd(10) {
+                    0 => rnd(12),
+                    1 => 6 + rnd(3),
+                    _ => if case % 2 == 0 { 7 } else { 3 },
+                };
+                for i in 0..fields {
+                    if i > 0 {
+                        t.push(b',');
+                    }
+                    let quote = rnd(5) == 0;
+                    if quote {
+                        t.push(b'"');
+                    }
+                    let flen = match rnd(200) { 0 => 20000 + rnd(30000), 1..=20 => 0, _ => rnd(14) };
+                    for _ in 0..flen {
+                        t.push(match rnd(60) { 0 => b'"', 1 => b'\r', 2 => b' ', _ => b'a' + rnd(26) as u8 });
+                    }
+                    if quote && rnd(30) != 0 {
+                        t.push(b'"');
+                    }
+                }
+                if rnd(40) == 0 {
+                    t.push(b'\n');
+                }
+                t.push(b'\n');
+            }
+            if rnd(3) == 0 {
+                t.pop();
+            }
+            let text: &'static [u8] = Box::leak(t.into_boxed_slice());
+            assert_eq!(scan_n::<7>(text), by_lines_n::<7>(text), "case {case} N=7");
+            assert_eq!(scan_n::<3>(text), by_lines_n::<3>(text), "case {case} N=3");
+            assert_eq!(scan_n::<2>(text), by_lines_n::<2>(text), "case {case} N=2");
+        }
     }
 
     #[test]
