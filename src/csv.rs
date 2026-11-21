@@ -75,26 +75,43 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     (s, n, q)
 }
 
+const NL: u32 = 1 << 31;
+const POS: u32 = NL - 1;
+
 /// One well-formed line: field i is `get(i)`, unquoted.
 pub struct Line<'a> {
     chunk: &'static [u8],
     start: usize,
-    ends: &'a [usize; 16],
+    /// At least N separator positions; a position may carry the NL tag.
+    ends: &'a [u32],
     quoted: bool,
 }
 
+/// Bounds of the field [s, e) without its wrapping quotes, branch-free.
+#[inline(always)]
+fn unwrap_field(chunk: &[u8], s: usize, e: usize) -> (usize, usize, usize) {
+    let ok = e >= s + 2;
+    let (a, b) = if ok { (s, e - 1) } else { (0, 0) };
+    // SAFETY: a, b < chunk.len() (0 when the field is shorter than 2).
+    let q = (ok & (unsafe { *chunk.get_unchecked(a) } == b'"') & (unsafe { *chunk.get_unchecked(b) } == b'"')) as usize;
+    (s + q, e - q, q)
+}
+
 impl Line<'_> {
+    /// Field i (i < N).
     #[inline(always)]
     pub fn get(&self, i: usize) -> &'static [u8] {
-        let s = if i == 0 { self.start } else { self.ends[i - 1] + 1 };
-        let e = self.ends[i];
-        // SAFETY: start <= s <= e <= chunk.len() for every field of a line.
-        let f = unsafe { self.chunk.get_unchecked(s..e) };
-        if self.quoted && f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' {
-            unsafe { f.get_unchecked(1..f.len() - 1) }
+        // SAFETY: i < N <= ends.len().
+        let s = if i == 0 { self.start } else { (unsafe { *self.ends.get_unchecked(i - 1) } & POS) as usize + 1 };
+        let e = (unsafe { *self.ends.get_unchecked(i) } & POS) as usize;
+        let (s, e) = if self.quoted {
+            let (s, e, _) = unwrap_field(self.chunk, s, e);
+            (s, e)
         } else {
-            f
-        }
+            (s, e)
+        };
+        // SAFETY: s <= e <= chunk.len().
+        unsafe { self.chunk.get_unchecked(s..e) }
     }
 }
 
@@ -102,16 +119,17 @@ impl Line<'_> {
 #[inline(always)]
 pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&Line)) {
     let len = chunk.len();
+    assert!(len < POS as usize, "chunk too large");
     let base = chunk.as_ptr();
     // ends[i] is where field i ends; field i starts after ends[i-1] (or at line_start).
-    let mut ends = [0usize; 16];
+    let mut ends = [0u32; 16];
     let mut nsep = 0usize;
     let mut line_start = 0usize;
     let mut q_before = 0usize; // quotes before the current block
     let mut q_line = 0usize; // quotes before line_start
     let mut tail = [0u8; 64];
 
-    let mut emit = |line_start: usize, nfields: usize, ends: &[usize; 16], quotes: usize| {
+    let mut emit = |line_start: usize, nfields: usize, ends: &[u32; 16], quotes: usize| {
         if nfields != N {
             return;
         }
@@ -119,12 +137,11 @@ pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&Li
             let mut wrapped = 0;
             let mut s = line_start;
             for &e in &ends[..N] {
-                if e - s >= 2 && chunk[s] == b'"' && chunk[e - 1] == b'"' {
-                    wrapped += 2;
-                }
+                let e = e as usize;
+                wrapped += unwrap_field(chunk, s, e).2;
                 s = e + 1;
             }
-            if wrapped != quotes {
+            if 2 * wrapped != quotes {
                 return;
             }
         }
@@ -145,7 +162,7 @@ pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&Li
             let tz = m.trailing_zeros() as usize;
             let p = b + tz;
             if nsep < 16 {
-                ends[nsep] = p;
+                ends[nsep] = p as u32;
             }
             nsep += 1;
             if (nl >> tz) & 1 != 0 {
@@ -162,7 +179,7 @@ pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&Li
     }
     if line_start < len {
         if nsep < 16 {
-            ends[nsep] = len;
+            ends[nsep] = len as u32;
         }
         emit(line_start, nsep + 1, &ends, q_before - q_line);
     }

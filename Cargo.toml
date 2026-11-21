@@ -8,7 +8,6 @@ publish = false
 [dependencies]
 memchr = "2"
 memmap2 = "0.9"
-parquet = { version = "57", default-features = false }
 
 [profile.release]
 opt-level = 3
