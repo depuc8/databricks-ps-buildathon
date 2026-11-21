@@ -35,6 +35,8 @@ pub const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const CHUNK: usize = 4 << 20;
+/// Clicks come last and are fewer: smaller pieces even out the threads.
+const CLICK_CHUNK: usize = 1 << 20;
 
 // ---------------------------------------------------------------- hashing
 
@@ -228,15 +230,17 @@ impl<T: Copy> Arena<T> {
         let ptr = map.as_mut_ptr() as *mut T;
         Arena { _map: map, ptr, cap, lens: vec![0; nb], spill: (0..nb).map(|_| Vec::new()).collect() }
     }
+    /// The next slot of bucket b, now counted as written, or None if the
+    /// bucket is full (then the value goes to its spill vector).
     #[inline(always)]
-    fn push(&mut self, b: usize, v: T) {
+    fn reserve(&mut self, b: usize) -> Option<*mut T> {
         let l = self.lens[b] as usize;
         if l < self.cap {
-            // SAFETY: b < nb and l < cap, inside the mapping.
-            unsafe { self.ptr.add(b * self.cap + l).write(v) };
             self.lens[b] = l as u32 + 1;
+            // SAFETY: b < nb and l < cap, inside the mapping.
+            Some(unsafe { self.ptr.add(b * self.cap + l) })
         } else {
-            self.spill[b].push(v);
+            None
         }
     }
     fn bucket(&self, b: usize) -> [&[T]; 2] {
@@ -249,10 +253,54 @@ impl<T: Copy> Arena<T> {
     }
 }
 
+/// Arena writes made a few values late: each slot is reserved and prefetched
+/// first, so that its store finds the line in cache instead of stalling on a
+/// miss. `flush` must run before the arena is read.
+struct Pending<T: Copy + Default> {
+    ring: [(*mut T, T); PENDING],
+    n: usize,
+}
+
+const PENDING: usize = 16;
+
+impl<T: Copy + Default> Pending<T> {
+    fn new() -> Self {
+        Pending { ring: [(std::ptr::null_mut(), T::default()); PENDING], n: 0 }
+    }
+    #[inline(always)]
+    fn push(&mut self, arena: &mut Arena<T>, b: usize, v: T) {
+        match arena.reserve(b) {
+            Some(dst) => {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                    _mm_prefetch(dst as *const i8, _MM_HINT_T0);
+                }
+                let slot = &mut self.ring[self.n % PENDING];
+                if self.n >= PENDING {
+                    // SAFETY: a slot reserved in a live arena.
+                    unsafe { slot.0.write(slot.1) };
+                }
+                *slot = (dst, v);
+                self.n += 1;
+            }
+            None => arena.spill[b].push(v),
+        }
+    }
+    fn flush(&mut self) {
+        for i in self.n.saturating_sub(PENDING)..self.n {
+            let (dst, v) = self.ring[i % PENDING];
+            // SAFETY: as in push.
+            unsafe { dst.write(v) };
+        }
+        self.n = 0;
+    }
+}
+
 // ---------------------------------------------------------------- records
 
 /// One parsed event copy. uid == 0 marks a copy that fails validation.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct Ev {
     eid: u64,
@@ -265,7 +313,7 @@ struct Ev {
 
 
 /// A surviving event: pc = price | category << 24 (price 0: not a purchase).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct Pe {
     person: u64,
@@ -273,7 +321,7 @@ struct Pe {
     pc: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct Ck {
     person: u64,
@@ -316,6 +364,7 @@ pub struct Ctx {
     we: i64,
     t0: i64,
     ingest_base: i64,
+    fast: ts::Fast,
     pub day0: i64,
     pub ndays: usize,
     products: FxMap<&'static [u8], u32>,
@@ -334,15 +383,19 @@ impl Ctx {
     pub fn organic(&self) -> usize {
         self.campaign_ids.len()
     }
+    /// The category of a product, given whether 16 bytes from its start
+    /// are readable.
     #[inline]
-    fn category(&self, product: &[u8]) -> u32 {
-        let k = ids::key(product);
+    fn category(&self, product: &[u8], wide: bool) -> u32 {
+        let k = ids::key_w(product, wide);
         let found = if k & ids::ODD == 0 { self.product_keys.get(k).map(|c| c as u32) } else { self.products.get(product).copied() };
         found.unwrap_or(self.unknown_cat)
     }
+    /// The index of a campaign, given whether 16 bytes from its start are
+    /// readable.
     #[inline]
-    fn campaign(&self, id: &[u8]) -> Option<u32> {
-        let k = ids::key(id);
+    fn campaign(&self, id: &[u8], wide: bool) -> Option<u32> {
+        let k = ids::key_w(id, wide);
         if k & ids::ODD == 0 {
             self.campaign_keys.get(k).map(|c| c as u32)
         } else {
@@ -350,8 +403,8 @@ impl Ctx {
         }
     }
     #[inline]
-    fn ingest_key(&self, ms: i64) -> u32 {
-        (ms.div_euclid(1000) - self.ingest_base).clamp(0, u32::MAX as i64) as u32
+    fn ingest_key(&self, secs: i64) -> u32 {
+        (secs - self.ingest_base).clamp(0, u32::MAX as i64) as u32
     }
     #[inline]
     fn day_of(&self, rel: u32) -> usize {
@@ -501,11 +554,11 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Line-aligned pieces of about CHUNK bytes.
-fn chunks(data: &'static [u8], out: &mut Vec<&'static [u8]>) {
+/// Line-aligned pieces of about `size` bytes.
+fn chunks(data: &'static [u8], size: usize, out: &mut Vec<&'static [u8]>) {
     let mut start = 0;
     while start < data.len() {
-        let mut end = (start + CHUNK).min(data.len());
+        let mut end = (start + size).min(data.len());
         if end < data.len() {
             end = match memchr(b'\n', &data[end..]) {
                 Some(i) => end + i + 1,
@@ -921,6 +974,7 @@ fn main() {
         we,
         t0,
         ingest_base: ws.div_euclid(1000) - (1i64 << 31),
+        fast: ts::Fast::new(t0 - 2 * DAY),
         day0,
         ndays,
         products,
@@ -941,33 +995,38 @@ fn main() {
     for p in csv_files(&data.join("events")) {
         let b = body(leak_read(&p));
         ev_bytes += b.len();
-        chunks(b, &mut ev_chunks);
+        chunks(b, CHUNK, &mut ev_chunks);
     }
     let mut ck_chunks = Vec::new();
     let mut ck_bytes = 0usize;
     for p in csv_files(&data.join("clicks")) {
         let b = body(leak_read(&p));
         ck_bytes += b.len();
-        chunks(b, &mut ck_chunks);
+        chunks(b, CLICK_CHUNK, &mut ck_chunks);
     }
     let n_ev_chunks = ev_chunks.len();
 
-    // Event lines average about 76 bytes and click lines about 46.
-    let est_ev = ev_bytes / 73 + 1024;
-    let est_ck = ck_bytes / 43 + 1024;
+    // Event lines average about 77 bytes and click lines about 47.
+    let est_ev = ev_bytes / 76 + 1024;
+    let est_ck = ck_bytes / 46 + 1024;
     // Buckets small enough that their hash tables stay in L2.
     let ev_bits = bits_for(est_ev, 3000, 6, 15);
     let p_bits = bits_for(est_ev, 6000, 6, 15);
     let (ev_shift, p_shift) = (64 - ev_bits, 64 - p_bits);
     let (nb_ev, nb_p) = (1usize << ev_bits, 1usize << p_bits);
     // Per thread and bucket, with slack for uneven chunks; overflow spills.
-    let per = |est: usize, nb: usize| est * 23 / 20 / nb / nthreads + 32;
+    // Every page of an arena gets touched (and zeroed by the kernel), so
+    // the slack costs time. The thread that builds the links parses about a
+    // third of a share of events; clicks come in fewer, larger chunks.
+    let per = |est: usize, nb: usize| est * 21 / 20 / nb / nthreads + 16;
+    let per_ev = est_ev * 108 / (100 * nthreads - 60).max(100) / nb_ev + 16;
+    let per_ck = est_ck * 23 / 20 / nb_p / nthreads + 16;
 
     let links: OnceLock<Links> = OnceLock::new();
     let mut parse_outs: Vec<ParseOut> = (0..nthreads)
         .map(|_| ParseOut {
-            ev: Arena::new(nb_ev, per(est_ev, nb_ev)),
-            ck: Arena::new(nb_p, per(est_ck, nb_p)),
+            ev: Arena::new(nb_ev, per_ev),
+            ck: Arena::new(nb_p, per_ck),
             odd: Vec::new(),
             scratch: Vec::new(),
             keys: Vec::new(),
@@ -1071,9 +1130,11 @@ fn main() {
                 }
             }
             links.resolve(&mut out.keys, &mut out.maybe);
+            let mut pending = Pending::new();
             for (&person, &(ts, pc)) in out.keys.iter().zip(&out.rest) {
-                out.pe.push(bucket_of(person, p_shift), Pe { person, ts, pc });
+                pending.push(&mut out.pe, bucket_of(person, p_shift), Pe { person, ts, pc });
             }
+            pending.flush();
         });
     }
     for o in &mut dedup_outs {
@@ -1129,7 +1190,9 @@ fn main() {
 
 fn parse_events(chunk: &'static [u8], ctx: &Ctx, shift: u32, out: &mut ParseOut) {
     let ParseOut { ev, odd, .. } = out;
-    csv::for_each_line::<7>(chunk, EventSink { ctx, shift, ev, odd });
+    let mut sink = EventSink { ctx, shift, ev, odd, pending: Pending::new() };
+    csv::for_each_line::<7>(chunk, &mut sink);
+    sink.pending.flush();
 }
 
 struct EventSink<'a> {
@@ -1137,6 +1200,7 @@ struct EventSink<'a> {
     shift: u32,
     ev: &'a mut Arena<Ev>,
     odd: &'a mut Vec<(u64, &'static [u8])>,
+    pending: Pending<Ev>,
 }
 
 impl csv::Sink for EventSink<'_> {
@@ -1149,18 +1213,19 @@ impl csv::Sink for EventSink<'_> {
         }
         let eid = ids::key_w(eid_s, eid_w);
         let mut e = Ev { eid, uid: 0, ingest: u32::MAX, ts: 0, pc: 0, _pad: 0 };
-        if let Some(ingest) = parse_ts(l.get(3)) {
+        if let Some(ingest) = ctx.fast.secs(l.get(3)) {
             e.ingest = ctx.ingest_key(ingest);
-            if let Some(t) = parse_ts(l.get(2)) {
+            let (ts, ts_w) = l.get_w(2);
+            if let Some(t) = ctx.fast.ms(ts, ts_w) {
                 let (uid, uid_w) = l.get_w(1);
-                if t >= ctx.ws && t < ctx.we && ingest - t <= DAY && !uid.is_empty() {
-                    let product = l.get(5);
+                if t >= ctx.ws && t < ctx.we && ingest * 1000 - t <= DAY && !uid.is_empty() {
+                    let (product, product_w) = l.get_w(5);
                     let valid = !product.is_empty()
                         && match l.get(4) {
                             b"view" | b"cart" => true,
                             b"purchase" => match parse_price(l.get(6)) {
                                 Some(p) => {
-                                    let cat = ctx.category(product);
+                                    let cat = ctx.category(product, product_w);
                                     e.pc = p | cat << 24;
                                     true
                                 }
@@ -1175,7 +1240,7 @@ impl csv::Sink for EventSink<'_> {
                 }
             }
         }
-        self.ev.push(bucket_of(eid, self.shift), e);
+        self.pending.push(self.ev, bucket_of(eid, self.shift), e);
     }
 }
 
@@ -1184,13 +1249,15 @@ fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out:
     // First the clicks with their user_id key in `person`; then the person
     // lookups, prefetched a few ahead, since the links table is large.
     scratch.clear();
-    csv::for_each_line::<4>(chunk, ClickSink { ctx, scratch, odd });
+    csv::for_each_line::<4>(chunk, &mut ClickSink { ctx, scratch, odd });
     keys.clear();
     keys.extend(scratch.iter().map(|c| c.person));
     links.resolve(keys, maybe);
+    let mut pending = Pending::new();
     for (c, &person) in scratch.iter().zip(keys.iter()) {
-        ck.push(bucket_of(person, shift), Ck { person, ..*c });
+        pending.push(ck, bucket_of(person, shift), Ck { person, ..*c });
     }
+    pending.flush();
 }
 
 struct ClickSink<'a> {
@@ -1207,15 +1274,16 @@ impl csv::Sink for ClickSink<'_> {
         if id.is_empty() || user.is_empty() {
             return;
         }
-        let t = match parse_ts(l.get(3)) {
+        let (ts, ts_w) = l.get_w(3);
+        let t = match ctx.fast.ms(ts, ts_w) {
             Some(t) if t >= ctx.t0 && t < ctx.we => t,
             _ => return,
         };
-        let camp_id = l.get(2);
+        let (camp_id, camp_w) = l.get_w(2);
         if camp_id.is_empty() {
             return;
         }
-        let camp = match ctx.campaign(camp_id) {
+        let camp = match ctx.campaign(camp_id, camp_w) {
             Some(c) => c,
             None => return,
         };
@@ -1234,13 +1302,15 @@ fn process_person(ctx: &Ctx, person: u64, evs: &[Pe], cks: &[Ck], out: &mut Pers
 
     let flush = |row: &UserRow, catsum: &mut [u64], users: &mut Vec<UserRow>| {
         let mut top = -1i32;
-        let mut best = 0u64;
-        for (c, s) in catsum.iter_mut().enumerate() {
-            if *s > best {
-                best = *s;
-                top = c as i32;
+        if row.revenue > 0 {
+            let mut best = 0u64;
+            for (c, s) in catsum.iter_mut().enumerate() {
+                if *s > best {
+                    best = *s;
+                    top = c as i32;
+                }
+                *s = 0;
             }
-            *s = 0;
         }
         users.push(UserRow { top, ..*row });
     };

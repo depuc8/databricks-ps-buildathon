@@ -4,10 +4,8 @@
 //! malformed for every N >= 2.
 //!
 //! No value holds a comma or newline, so quotes never change where fields
-//! split. A line's quoting is valid exactly when its quote count is twice the
-//! number of its fields that start and end with a quote (length >= 2): any
-//! other quote is one too many. The scan finds `,` `\n` `"` 64 bytes at a time
-//! as bitmaps.
+//! split. The scan finds `,` `\n` `"` 64 bytes at a time as bitmaps, and
+//! checks the quotes of a whole block with bit operations (see `scan`).
 
 /// Splits `line` into exactly N unquoted values; false if malformed.
 #[inline]
@@ -75,24 +73,13 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     (s, n, q)
 }
 
-const NL: u32 = 1 << 31;
-const POS: u32 = NL - 1;
-
 /// One well-formed line: field i is `get(i)`, unquoted.
 pub struct Line<'a> {
     chunk: &'static [u8],
-    /// Each field as start | end << 32, quotes already stripped.
-    bounds: &'a [u64; 16],
-}
-
-/// Bounds of the field [s, e) without its wrapping quotes, branch-free.
-#[inline(always)]
-fn unwrap_field(chunk: &[u8], s: usize, e: usize) -> (usize, usize, usize) {
-    let ok = e >= s + 2;
-    let (a, b) = if ok { (s, e - 1) } else { (0, 0) };
-    // SAFETY: a, b < chunk.len() (0 when the field is shorter than 2).
-    let q = (ok & (unsafe { *chunk.get_unchecked(a) } == b'"') & (unsafe { *chunk.get_unchecked(b) } == b'"')) as usize;
-    (s + q, e - q, q)
+    /// Separator positions; the line's are ring[first..first + N] (mod 64),
+    /// and ring[first - 1] is the newline before it.
+    ring: &'a [u32; 64],
+    first: usize,
 }
 
 impl Line<'_> {
@@ -100,15 +87,20 @@ impl Line<'_> {
     #[inline(always)]
     pub fn get_w(&self, i: usize) -> (&'static [u8], bool) {
         let f = self.get(i);
-        (f, self.bounds[i] as u32 as usize + 16 <= self.chunk.len())
+        (f, f.as_ptr() as usize + 16 <= self.chunk.as_ptr() as usize + self.chunk.len())
     }
 
     /// Field i (i < N).
     #[inline(always)]
     pub fn get(&self, i: usize) -> &'static [u8] {
-        let v = self.bounds[i];
-        // SAFETY: start <= end <= chunk.len() for the N fields of a line.
-        unsafe { self.chunk.get_unchecked(v as u32 as usize..(v >> 32) as usize) }
+        let s = self.ring[(self.first + i).wrapping_sub(1) & 63].wrapping_add(1) as usize;
+        let e = self.ring[(self.first + i) & 63] as usize;
+        // SAFETY: s <= e < chunk.len(), e being a separator. A field that
+        // starts with a quote is wrapped in quotes: the line passed the check.
+        unsafe {
+            let q = (*self.chunk.get_unchecked(s) == b'"') as usize;
+            self.chunk.get_unchecked(s + q..e - q)
+        }
     }
 }
 
@@ -125,48 +117,61 @@ impl<F: FnMut(&Line)> Sink for F {
     }
 }
 
-/// The end of a line with `nfields` fields, whose bounds are in `bounds`:
-/// strips and checks the quotes, then passes the line on if well-formed.
+/// XOR of bits 0..=i of x, in bit i.
 #[inline(always)]
-fn line_end<const N: usize>(
-    chunk: &'static [u8],
-    bounds: &mut [u64; 16],
-    nfields: usize,
-    quotes: usize,
-    f: &mut impl Sink,
-) {
-    if nfields != N {
-        return;
-    }
-    if quotes != 0 {
-        let mut wrapped = 0;
-        for b in bounds.iter_mut().take(N) {
-            let (fs, fe, q) = unwrap_field(chunk, *b as u32 as usize, (*b >> 32) as usize);
-            *b = fs as u64 | (fe as u64) << 32;
-            wrapped += q;
-        }
-        if 2 * wrapped != quotes {
-            return;
-        }
-    }
-    f.line(&Line { chunk, bounds });
+fn prefix_xor(mut x: u64) -> u64 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^ x << 32
 }
 
-/// Calls `f` with every well-formed line of N fields in `chunk`. N <= 15.
-///
-/// Each field's bounds are stored as one u64 as its separator is found, so
-/// the per-line code reads them back with loads of the same width (a wider
-/// load of several fresh narrow stores stalls on store forwarding).
+/// Calls `f` with every well-formed line of N fields in `chunk`. N < 32.
 #[inline(always)]
-pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl Sink) {
+pub fn for_each_line<const N: usize>(chunk: &'static [u8], f: &mut impl Sink) {
+    let main = match memchr::memrchr(b'\n', chunk) {
+        Some(i) => &chunk[..=i],
+        None => &chunk[..0],
+    };
+    scan::<N>(main, f);
+    // A last line without its newline (only at the end of a file): scan a
+    // copy that has one.
+    let rest = &chunk[main.len()..];
+    if !rest.is_empty() {
+        let mut v = rest.to_vec();
+        v.push(b'\n');
+        scan::<N>(Box::leak(v.into_boxed_slice()), f);
+    }
+}
+
+/// `for_each_line` for a chunk that ends with a newline.
+///
+/// Quotes are checked for all the lines of a block at once. With the quote
+/// parity counted from the start of each line, a line's quoting is valid
+/// exactly when every quote that opens (parity 1) starts a field, every
+/// quote that closes (parity 0) is followed by a separator, and no separator
+/// (the newline included) has parity 1. Then a field starting with a quote
+/// is wrapped in quotes, and no other field holds one. The parity from the
+/// start of the chunk, G, becomes per line by XOR with C, G at the newline
+/// before: C is a fill from each newline where G is 1 up to the next
+/// newline, made by one subtraction (a borrow runs up to the next newline).
+/// A line is dropped if it has a bad bit or does not have N separators.
+#[inline(always)]
+fn scan<const N: usize>(chunk: &'static [u8], f: &mut impl Sink) {
     let len = chunk.len();
-    assert!(len < POS as usize, "chunk too large");
+    assert!(len < u32::MAX as usize, "chunk too large");
     let base = chunk.as_ptr();
-    let mut bounds = [0u64; 16];
-    let mut nsep = 0usize;
-    let mut field_start = 0u64;
-    let mut q_before = 0usize; // quotes before the current block
-    let mut q_line = 0usize; // quotes before the current line
+    let mut ring = [0u32; 64];
+    ring[63] = u32::MAX; // the newline before the chunk
+    let mut w = 0usize; // separators so far
+    let mut line = 0usize; // separators before the line in progress
+    let mut par = 0u64; // all ones after an odd number of quotes
+    let mut borrow = 0u64; // the line in progress started at parity 1
+    let mut sep_hi = 1u64; // a field starts at the next block's byte 0
+    let mut close_hi = 0u64; // a closing quote ended the last block
+    let mut bad_open = false; // a bad bit in the line in progress
     let mut tail = [0u8; 64];
 
     let mut b = 0;
@@ -178,38 +183,54 @@ pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl Sink) {
             tail[..len - b].copy_from_slice(&chunk[b..]);
             unsafe { masks(tail.as_ptr()) }
         };
+        let g = prefix_xor(q) ^ par;
+        par = ((g as i64) >> 63) as u64;
+        let ones = nl & g;
+        let (r, o1) = nl.overflowing_sub(ones << 1);
+        let (r, o2) = r.overflowing_sub(borrow);
+        borrow = (o1 | o2) as u64 | ones >> 63;
+        let parity = g ^ nl ^ r;
+        let starts = sep << 1 | sep_hi;
+        sep_hi = sep >> 63;
+        let close = q & !parity;
+        let mut bad = (q & parity & !starts) | ((close << 1 | close_hi) & !sep) | (sep & parity);
+        close_hi = close >> 63;
+
+        // Every separator position goes to the ring, eight unconditionally.
+        let cnt = sep.count_ones() as usize;
         let mut m = sep;
+        for k in 0..8 {
+            ring[(w + k) & 63] = (b as u32).wrapping_add(m.trailing_zeros());
+            m &= m.wrapping_sub(1);
+        }
+        let mut k = 8;
         while m != 0 {
-            let tz = m.trailing_zeros() as usize;
-            let p = (b + tz) as u64;
-            if nsep < 16 {
-                bounds[nsep] = field_start | p << 32;
-            }
-            nsep += 1;
-            field_start = p + 1;
-            if (nl >> tz) & 1 != 0 {
-                let q_at = q_before + (q & ((1u64 << tz) - 1)).count_ones() as usize;
-                line_end::<N>(chunk, &mut bounds, nsep, q_at - q_line, &mut f);
-                q_line = q_at;
-                nsep = 0;
-            }
+            ring[(w + k) & 63] = b as u32 + m.trailing_zeros();
             m &= m - 1;
+            k += 1;
         }
-        q_before += q.count_ones() as usize;
+        let mut n = nl;
+        while n != 0 {
+            let upto = (2u64 << n.trailing_zeros()).wrapping_sub(1);
+            let end = w + (sep & upto).count_ones() as usize;
+            if end - line == N && !bad_open && bad & upto == 0 {
+                f.line(&Line { chunk, ring: &ring, first: line });
+            }
+            bad &= !upto;
+            bad_open = false;
+            line = end;
+            n &= n - 1;
+        }
+        bad_open |= bad != 0;
+        w += cnt;
         b += 64;
-    }
-    if (field_start as usize) < len || nsep > 0 {
-        if nsep < 16 {
-            bounds[nsep] = field_start | (len as u64) << 32;
-        }
-        line_end::<N>(chunk, &mut bounds, nsep + 1, q_before - q_line, &mut f);
     }
 }
 
-/// Calls `f` with the N values of every well-formed line in `chunk`. N <= 15.
+/// Calls `f` with the N values of every well-formed line in `chunk`. N < 32.
 #[inline(always)]
 pub fn for_each<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&[&'static [u8]; N])) {
-    for_each_line::<N>(chunk, |line: &Line| f(&std::array::from_fn(|i| line.get(i))));
+    for_each_line::<N>(chunk, &mut |line: &Line| f(&std::array::from_fn(|i| line.get(i))));
 }
 
 #[cfg(test)]
@@ -325,6 +346,34 @@ mod tests {
             assert_eq!(scan_n::<7>(text), by_lines_n::<7>(text), "case {case} N=7");
             assert_eq!(scan_n::<3>(text), by_lines_n::<3>(text), "case {case} N=3");
             assert_eq!(scan_n::<2>(text), by_lines_n::<2>(text), "case {case} N=2");
+        }
+    }
+
+    /// Random text over a tiny alphabet: odd quote counts, quotes at block
+    /// edges, runs of empty lines and fields.
+    #[test]
+    fn scan_fuzz_dense() {
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for case in 0..20_000 {
+            let alphabet: &[u8] = match case % 4 {
+                0 => b"\",\na",
+                1 => b"\"\",,,\nab\r",
+                2 => b"\"a,\n",
+                _ => b"\"\"\"\",,,,,,\n\naaaaaaaaaa",
+            };
+            let n = rnd(if case % 10 == 0 { 2000 } else { 300 }) as usize;
+            let t: Vec<u8> = (0..n).map(|_| alphabet[rnd(alphabet.len() as u64) as usize]).collect();
+            let text: &'static [u8] = Box::leak(t.into_boxed_slice());
+            assert_eq!(scan_n::<7>(text), by_lines_n::<7>(text), "case {case} N=7");
+            assert_eq!(scan_n::<4>(text), by_lines_n::<4>(text), "case {case} N=4");
+            assert_eq!(scan_n::<2>(text), by_lines_n::<2>(text), "case {case} N=2");
+            assert_eq!(scan_n::<1>(text), by_lines_n::<1>(text), "case {case} N=1");
         }
     }
 
