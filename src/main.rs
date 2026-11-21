@@ -597,6 +597,7 @@ impl Links {
 
 extern "C" {
     fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+    fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut std::ffi::c_void;
 }
 
 /// Drops the page mappings of the whole pages inside `chunk`, a read-only
@@ -626,16 +627,32 @@ fn populate(chunk: &[u8]) {
     }
 }
 
+/// A file's bytes, mapped read-only for the rest of the run, with at least
+/// a page of readable zeros after them (see `csv::for_each_line_padded`):
+/// the file goes over the start of a larger anonymous mapping.
 fn leak_read(path: &Path) -> &'static [u8] {
+    use std::os::fd::AsRawFd;
+    const PAGE: usize = 4096;
+    const PROT_READ: i32 = 1;
+    const MAP_PRIVATE: i32 = 2;
+    const MAP_FIXED: i32 = 0x10;
+    const MAP_ANONYMOUS: i32 = 0x20;
     let file = fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0) as usize;
     if len == 0 {
         return &[];
     }
-    // SAFETY: /data is read-only and nobody changes the files while we run.
-    let map = unsafe { memmap2::Mmap::map(&file) }.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let map: &'static memmap2::Mmap = Box::leak(Box::new(map));
-    &map[..]
+    let total = len.next_multiple_of(PAGE) + PAGE;
+    // SAFETY: a fresh mapping, then the file over its start; /data is
+    // read-only and nobody changes the files while we run. Neither is ever
+    // unmapped.
+    unsafe {
+        let base = mmap(std::ptr::null_mut(), total, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        assert!(base as isize != -1, "{}: mmap failed", path.display());
+        let p = mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0);
+        assert!(p == base, "{}: mmap failed", path.display());
+        std::slice::from_raw_parts(p as *const u8, len)
+    }
 }
 
 /// The lines after the header, as one slice.
@@ -754,11 +771,14 @@ fn build_links(files: &[PathBuf]) -> Links {
     let mut pairs: Vec<(u64, u64)> = Vec::new();
     let mut odd = Vec::new();
     for p in files {
-        csv::for_each::<2>(body(leak_read(p)), |f| {
-            if !f[0].is_empty() && !f[1].is_empty() {
-                pairs.push((ids::key_keep(f[0], &mut odd), ids::key_keep(f[1], &mut odd)));
+        let mut add = |l: &csv::Line| {
+            let ((a, aw), (b, bw)) = (l.get_w(0), l.get_w(1));
+            if !a.is_empty() && !b.is_empty() {
+                pairs.push((ids::key_keep_w(a, aw, &mut odd), ids::key_keep_w(b, bw, &mut odd)));
             }
-        });
+        };
+        // SAFETY: `leak_read` pads its mappings.
+        unsafe { csv::for_each_line_padded::<2>(body(leak_read(p)), &mut add) };
     }
     let odd_map: Odd = odd.iter().copied().collect();
 
@@ -844,15 +864,18 @@ fn build_links(files: &[PathBuf]) -> Links {
             best[r] = keys[i];
         }
     }
-    // parent is fully compressed now: the name of id i is best[parent[i]].
-    let name = |i: usize| best[parent[i] as usize];
+    // parent is fully compressed now: the name of id i is best[parent[i]],
+    // looked up once (in random order) for both passes below.
+    let names: Vec<u64> = parent.iter().map(|&r| best[r as usize]).collect();
+    drop(best);
 
     // The map holds only renamed IDs, each partition sized for its own.
     let mut base = vec![0u32; np + 1];
     let mut mask = vec![0u32; np];
     let mut renamed = 0;
     for p in 0..np {
-        let r = (id_start[p]..id_start[p + 1]).filter(|&i| name(i as usize) != keys[i as usize]).count();
+        let ids = id_start[p] as usize..id_start[p + 1] as usize;
+        let r = ids.filter(|&i| names[i] != keys[i]).count();
         renamed += r;
         let size = (r * 4 / 3 + 1).next_power_of_two().max(2);
         mask[p] = size as u32 - 1;
@@ -862,9 +885,8 @@ fn build_links(files: &[PathBuf]) -> Links {
     let mut bloom = Bloom::new(renamed);
     for p in 0..np {
         for i in id_start[p] as usize..id_start[p + 1] as usize {
-            let nm = name(i);
-            if nm != keys[i] {
-                map.insert(keys[i], nm);
+            if names[i] != keys[i] {
+                map.insert(keys[i], names[i]);
                 bloom.insert(keys[i]);
             }
         }
@@ -898,7 +920,11 @@ pub struct PersonOut {
     pub assisted: Vec<u32>,
     sess: Vec<Session>,
     catsum: Vec<u64>,
-    assist: Vec<(u32, u32)>,
+    /// Per campaign: the open assist interval and the stamp of the person
+    /// it belongs to.
+    camp_iv: Vec<(u64, u64, u32)>,
+    stamp: u32,
+    touched: Vec<u32>,
     group: Group,
 }
 
@@ -927,7 +953,7 @@ struct Group {
     hist: Vec<u32>,
     tmp: Vec<Tp>,
     evs: Vec<Tp>,
-    ck_local: Vec<u32>,
+    ck_tmp: Vec<Ck>,
     ck_starts: Vec<u32>,
     cks: Vec<Ck>,
 }
@@ -935,13 +961,13 @@ struct Group {
 /// Moves `src` to `dst` in the order of `key`, given each key's first
 /// place in `at`; stable.
 #[inline(always)]
-fn radix_pass(src: &[Tp], dst: &mut Vec<Tp>, at: &mut [u32], key: impl Fn(u32) -> usize) {
+fn radix_pass<T: Copy>(src: &[T], dst: &mut Vec<T>, at: &mut [u32], key: impl Fn(&T) -> usize) {
     dst.clear();
     dst.reserve(src.len());
     let out = dst.as_mut_ptr();
     assert_eq!(at.len(), DIGIT);
     for t in src {
-        let k = key(t.ts) & (DIGIT - 1);
+        let k = key(t) & (DIGIT - 1);
         // SAFETY: k < DIGIT = at.len(); the places of all keys are below
         // src.len().
         unsafe {
@@ -958,9 +984,9 @@ impl Group {
 
     /// Fills evs/starts and cks/ck_starts: person p owns
     /// evs[starts[p]..starts[p + 1]] sorted by ts, and the same range of cks
-    /// sorted by ts, then click_id descending. Clicks of a person with no
-    /// events are dropped.
-    fn build(&mut self, ev_parts: &[&[Pe]], ck_parts: &[&[Ck]], odd: &Odd) {
+    /// sorted by ts (ties in input order). Clicks of a person with no events
+    /// are dropped.
+    fn build(&mut self, ev_parts: &[&[Pe]], ck_parts: &[&[Ck]]) {
         let n: usize = ev_parts.iter().map(|p| p.len()).sum();
         let size = (n * 2).next_power_of_two().max(16);
         let (mask, shift) = (size - 1, 64 - size.trailing_zeros());
@@ -1017,9 +1043,9 @@ impl Group {
         }
         let (h0, rest) = hist.split_at_mut(DIGIT);
         let (h1, h2) = rest.split_at_mut(DIGIT);
-        radix_pass(&self.evs, &mut self.tmp, h0, |ts| ts as usize);
-        radix_pass(&self.tmp, &mut self.evs, h1, |ts| ts as usize >> 11);
-        radix_pass(&self.evs, &mut self.tmp, h2, |ts| ts as usize >> 22);
+        radix_pass(&self.evs, &mut self.tmp, h0, |t| t.ts as usize);
+        radix_pass(&self.tmp, &mut self.evs, h1, |t| t.ts as usize >> 11);
+        radix_pass(&self.evs, &mut self.tmp, h2, |t| t.ts as usize >> 22);
         // Then by person, stably: each person's events come out by ts.
         for p in 0..np {
             self.starts[p + 1] += self.starts[p];
@@ -1037,7 +1063,12 @@ impl Group {
         // SAFETY: every place in 0..n was written once.
         unsafe { self.evs.set_len(n) };
 
-        self.ck_local.clear();
+        // Clicks the same way, those of persons without events dropped; the
+        // person field becomes the person's index.
+        hist.fill(0);
+        self.ck_starts.clear();
+        self.ck_starts.resize(np + 1, 0);
+        self.ck_tmp.clear();
         for part in ck_parts {
             for c in *part {
                 let mut i = slot_of(c.person, shift);
@@ -1051,54 +1082,51 @@ impl Group {
                     }
                     i = (i + 1) & mask;
                 };
-                self.ck_local.push(id);
+                if id == u32::MAX {
+                    continue;
+                }
+                // SAFETY: as for the events.
+                unsafe {
+                    *self.ck_starts.get_unchecked_mut(id as usize + 1) += 1;
+                    *hist.get_unchecked_mut(c.ts as usize & (DIGIT - 1)) += 1;
+                    *hist.get_unchecked_mut(DIGIT + (c.ts as usize >> 11 & (DIGIT - 1))) += 1;
+                    *hist.get_unchecked_mut(2 * DIGIT + (c.ts as usize >> 22)) += 1;
+                }
+                self.ck_tmp.push(Ck { person: id as u64, ..*c });
             }
         }
-        counting_place(ck_parts, &self.ck_local, np, &mut self.ck_starts, &mut self.cks);
+        for d in hist.chunks_mut(DIGIT) {
+            let mut at = 0;
+            for c in d {
+                (*c, at) = (at, at + *c);
+            }
+        }
+        let (h0, rest) = hist.split_at_mut(DIGIT);
+        let (h1, h2) = rest.split_at_mut(DIGIT);
+        radix_pass(&self.ck_tmp, &mut self.cks, h0, |c| c.ts as usize);
+        radix_pass(&self.cks, &mut self.ck_tmp, h1, |c| c.ts as usize >> 11);
+        radix_pass(&self.ck_tmp, &mut self.cks, h2, |c| c.ts as usize >> 22);
         for p in 0..np {
-            let (a, b) = (self.ck_starts[p] as usize, self.ck_starts[p + 1] as usize);
-            if b - a > 1 {
-                self.cks[a..b].sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| ids::cmp(y.id, x.id, odd)));
-            }
+            self.ck_starts[p + 1] += self.ck_starts[p];
         }
+        let m = self.cks.len();
+        self.ck_tmp.clear();
+        self.ck_tmp.reserve(m);
+        let out = self.ck_tmp.as_mut_ptr();
+        let mut at: Vec<u32> = self.ck_starts[..np].to_vec();
+        for c in &self.cks {
+            let k = &mut at[c.person as usize];
+            // SAFETY: person p's places are ck_starts[p]..ck_starts[p + 1] <= m.
+            unsafe { out.add(*k as usize).write(*c) };
+            *k += 1;
+        }
+        // SAFETY: every place in 0..m was written once.
+        unsafe { self.ck_tmp.set_len(m) };
+        std::mem::swap(&mut self.cks, &mut self.ck_tmp);
         for &i in &self.filled {
             table[i as usize] = (0, 0);
         }
     }
-}
-
-/// Counting sort of `parts` (in order) by `local` (u32::MAX: drop) into `out`.
-fn counting_place<T: Copy>(parts: &[&[T]], local: &[u32], np: usize, starts: &mut Vec<u32>, out: &mut Vec<T>) {
-    starts.clear();
-    starts.resize(np + 1, 0);
-    for &id in local {
-        if id != u32::MAX {
-            starts[id as usize + 1] += 1;
-        }
-    }
-    for p in 0..np {
-        starts[p + 1] += starts[p];
-    }
-    let total = starts[np] as usize;
-    out.clear();
-    out.reserve(total);
-    let mut cursor: Vec<u32> = starts[..np].to_vec();
-    let dst = out.as_mut_ptr();
-    let mut k = 0;
-    for part in parts {
-        for v in *part {
-            let id = local[k];
-            k += 1;
-            if id != u32::MAX {
-                let c = &mut cursor[id as usize];
-                // SAFETY: cursor[id] < starts[id + 1] <= total <= capacity.
-                unsafe { dst.add(*c as usize).write(*v) };
-                *c += 1;
-            }
-        }
-    }
-    // SAFETY: every slot in 0..total was written exactly once.
-    unsafe { out.set_len(total) };
 }
 
 #[derive(Clone, Copy)]
@@ -1375,7 +1403,9 @@ fn main() {
             assisted: vec![0; (ctx.organic() + 1) * ndays],
             sess: Vec::new(),
             catsum: vec![0; ncat],
-            assist: Vec::new(),
+            camp_iv: vec![(0, 0, 0); ctx.organic() + 1],
+            stamp: 0,
+            touched: Vec::new(),
             group: Group::default(),
         })
         .collect();
@@ -1392,7 +1422,7 @@ fn main() {
             let ev_parts: Vec<&[Pe]> = dedup_outs.iter().flat_map(|d| d.pe.bucket(b)).collect();
             let ck_parts: Vec<&[Ck]> = parse_outs.iter().flat_map(|p| p.ck.bucket(b)).collect();
             let mut g = std::mem::take(&mut out.group);
-            g.build(&ev_parts, &ck_parts, odd);
+            g.build(&ev_parts, &ck_parts);
             for p in 0..g.persons.len() {
                 let evs = &g.evs[g.starts[p] as usize..g.starts[p + 1] as usize];
                 let cks = &g.cks[g.ck_starts[p] as usize..g.ck_starts[p + 1] as usize];
@@ -1415,7 +1445,8 @@ fn main() {
 fn parse_events(chunk: &'static [u8], ctx: &Ctx, shift: u32, out: &mut ParseOut) {
     let ParseOut { ev, odd, .. } = out;
     let mut sink = EventSink { ctx, shift, ev, odd, pending: Pending::new() };
-    csv::for_each_line::<7>(chunk, &mut sink);
+    // SAFETY: chunks come from `leak_read`, padded.
+    unsafe { csv::for_each_line_padded::<7>(chunk, &mut sink) };
     sink.pending.flush();
 }
 
@@ -1490,7 +1521,8 @@ fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out:
     // First the clicks with their user_id key in `person`; then the person
     // lookups, prefetched a few ahead, since the links table is large.
     scratch.clear();
-    csv::for_each_line::<4>(chunk, &mut ClickSink { ctx, scratch, odd });
+    // SAFETY: chunks come from `leak_read`, padded.
+    unsafe { csv::for_each_line_padded::<4>(chunk, &mut ClickSink { ctx, scratch, odd }) };
     keys.clear();
     keys.extend(scratch.iter().map(|c| c.person));
     links.resolve(keys, cand);
@@ -1582,14 +1614,26 @@ fn process_person(ctx: &Ctx, person: u64, evs: &[Tp], cks: &[Ck], odd: &Odd, out
     }
     flush(&row, &mut out.catsum, &mut out.users);
 
-    // Credit: the latest click at or before the start, within 7 days. Clicks
-    // are sorted by ts, then click_id descending, so the last one wins a tie.
+    // Credit: the latest click at or before the start, within 7 days; among
+    // clicks at that same ts (rare), the smallest click_id.
     let mut j = 0;
     for s in &out.sess {
         while j < cks.len() && cks[j].ts <= s.start {
             j += 1;
         }
-        let camp = if j > 0 && (s.start - cks[j - 1].ts) as i64 <= WEEK { cks[j - 1].camp as usize } else { organic };
+        let camp = if j > 0 && (s.start - cks[j - 1].ts) as i64 <= WEEK {
+            let t = cks[j - 1].ts;
+            let (mut best, mut k) = (j - 1, j - 1);
+            while k > 0 && cks[k - 1].ts == t {
+                k -= 1;
+                if ids::cmp(cks[k].id, cks[best].id, odd).is_lt() {
+                    best = k;
+                }
+            }
+            cks[best].camp as usize
+        } else {
+            organic
+        };
         let st = &mut out.credit[camp * nd + s.day as usize];
         st.sessions += 1;
         st.purchasing += s.purchase as u32;
@@ -1597,11 +1641,13 @@ fn process_person(ctx: &Ctx, person: u64, evs: &[Tp], cks: &[Ck], odd: &Odd, out
     }
 
     // Assists: a click at t assists the sessions starting in [t, t + 7 days].
-    // Per campaign, merge those intervals and count the sessions in each.
+    // Per campaign, merge those intervals (the clicks come by ts) and count
+    // the sessions in each.
     if cks.is_empty() {
         return;
     }
-    let sess = &out.sess;
+    let PersonOut { sess, assisted, camp_iv, stamp, touched, .. } = out;
+    let sess = &*sess;
     // day_end[d]: the first session starting after day d.
     let mut day_end_small = [0usize; 32];
     let mut day_end_vec = Vec::new();
@@ -1619,7 +1665,6 @@ fn process_person(ctx: &Ctx, person: u64, evs: &[Tp], cks: &[Ck], odd: &Odd, out
         *slot = k;
     }
     let day_end = &*day_end;
-    let assisted = &mut out.assisted;
     let mut add = |camp: u32, a: u64, b: u64| {
         let lo = sess.partition_point(|s| (s.start as u64) < a);
         let hi = sess.partition_point(|s| (s.start as u64) <= b);
@@ -1636,24 +1681,23 @@ fn process_person(ctx: &Ctx, person: u64, evs: &[Tp], cks: &[Ck], odd: &Odd, out
         add(c.camp, c.ts as u64, c.ts as u64 + WEEK as u64);
         return;
     }
-    out.assist.clear();
-    out.assist.extend(cks.iter().map(|c| (c.camp, c.ts)));
-    out.assist.sort_unstable();
-    let assist = &out.assist;
-    let mut i = 0;
-    while i < assist.len() {
-        let camp = assist[i].0;
-        let (mut a, mut b) = (assist[i].1 as u64, assist[i].1 as u64 + WEEK as u64);
-        i += 1;
-        while i < assist.len() && assist[i].0 == camp {
-            let t = assist[i].1 as u64;
-            if t > b {
-                add(camp, a, b);
-                a = t;
-            }
-            b = t + WEEK as u64;
-            i += 1;
+    *stamp += 1;
+    touched.clear();
+    for c in cks {
+        let t = c.ts as u64;
+        let iv = &mut camp_iv[c.camp as usize];
+        if iv.2 != *stamp {
+            *iv = (t, t + WEEK as u64, *stamp);
+            touched.push(c.camp);
+        } else if t > iv.1 {
+            add(c.camp, iv.0, iv.1);
+            (iv.0, iv.1) = (t, t + WEEK as u64);
+        } else {
+            iv.1 = t + WEEK as u64;
         }
-        add(camp, a, b);
+    }
+    for &camp in touched.iter() {
+        let iv = camp_iv[camp as usize];
+        add(camp, iv.0, iv.1);
     }
 }

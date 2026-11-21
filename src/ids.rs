@@ -111,19 +111,6 @@ pub fn key(s: &[u8]) -> u64 {
     }
 }
 
-/// The key of a non-empty ID, keeping an odd ID's bytes in `odd`.
-#[inline]
-pub fn key_keep(s: &'static [u8], odd: &mut Vec<(u64, &'static [u8])>) -> u64 {
-    match pack(s) {
-        Some(v) => v,
-        None => {
-            let k = hash_odd(s);
-            odd.push((k, s));
-            k
-        }
-    }
-}
-
 pub fn bytes<'a>(k: u64, buf: &'a mut [u8; 10], odd: &Odd) -> &'a [u8] {
     if k & ODD != 0 {
         return odd[&k];

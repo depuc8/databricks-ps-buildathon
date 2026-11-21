@@ -78,6 +78,8 @@ pub struct Line<'a> {
     chunk: &'static [u8],
     /// The newline before the line, then the line's N separators.
     seps: &'a [u32],
+    /// 16 bytes after the chunk are readable.
+    padded: bool,
 }
 
 impl Line<'_> {
@@ -85,7 +87,7 @@ impl Line<'_> {
     #[inline(always)]
     pub fn get_w(&self, i: usize) -> (&'static [u8], bool) {
         let f = self.get(i);
-        (f, f.as_ptr() as usize + 16 <= self.chunk.as_ptr() as usize + self.chunk.len())
+        (f, self.padded || f.as_ptr() as usize + 16 <= self.chunk.as_ptr() as usize + self.chunk.len())
     }
 
     /// Field i (i < N).
@@ -139,18 +141,36 @@ fn prefix_xor(mut x: u64) -> u64 {
 /// Calls `f` with every well-formed line of N fields in `chunk`. N < 32.
 #[inline(always)]
 pub fn for_each_line<const N: usize>(chunk: &'static [u8], f: &mut impl Sink) {
+    lines::<N, false>(chunk, f);
+}
+
+/// `for_each_line`, for a chunk followed by at least 16 readable bytes, so
+/// that every field can be read 16 bytes wide.
+///
+/// # Safety
+/// The 16 bytes after `chunk` must be readable.
+#[inline(always)]
+pub unsafe fn for_each_line_padded<const N: usize>(chunk: &'static [u8], f: &mut impl Sink) {
+    lines::<N, true>(chunk, f);
+}
+
+#[inline(always)]
+fn lines<const N: usize, const PADDED: bool>(chunk: &'static [u8], f: &mut impl Sink) {
     let main = match memchr::memrchr(b'\n', chunk) {
         Some(i) => &chunk[..=i],
         None => &chunk[..0],
     };
-    scan::<N>(main, f);
+    scan::<N, PADDED>(main, f);
     // A last line without its newline (only at the end of a file): scan a
-    // copy that has one.
+    // copy that has one, and padding.
     let rest = &chunk[main.len()..];
     if !rest.is_empty() {
         let mut v = rest.to_vec();
         v.push(b'\n');
-        scan::<N>(Box::leak(v.into_boxed_slice()), f);
+        let n = v.len();
+        v.resize(n + 16, 0);
+        let copy: &'static [u8] = Box::leak(v.into_boxed_slice());
+        scan::<N, PADDED>(&copy[..n], f);
     }
 }
 
@@ -167,7 +187,7 @@ pub fn for_each_line<const N: usize>(chunk: &'static [u8], f: &mut impl Sink) {
 /// newline, made by one subtraction (a borrow runs up to the next newline).
 /// A line is dropped if it has a bad bit or does not have N separators.
 #[inline(always)]
-fn scan<const N: usize>(chunk: &'static [u8], f: &mut impl Sink) {
+fn scan<const N: usize, const PADDED: bool>(chunk: &'static [u8], f: &mut impl Sink) {
     let len = chunk.len();
     assert!(len < u32::MAX as usize, "chunk too large");
     let base = chunk.as_ptr();
@@ -237,7 +257,7 @@ fn scan<const N: usize>(chunk: &'static [u8], f: &mut impl Sink) {
             let upto = (2u64 << n.trailing_zeros()).wrapping_sub(1);
             let end = w + (sep & upto).count_ones() as usize;
             if end - line == N && !bad_open && bad & upto == 0 {
-                f.line(&Line { chunk, seps: &pos[line - 1..end] });
+                f.line(&Line { chunk, seps: &pos[line - 1..end], padded: PADDED });
             }
             bad &= !upto;
             bad_open = false;
