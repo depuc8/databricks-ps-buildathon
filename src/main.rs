@@ -246,6 +246,80 @@ impl<T: Copy> Arena<T> {
     fn total(&self) -> usize {
         self.lens.iter().map(|&l| l as usize).sum::<usize>() + self.spill.iter().map(|s| s.len()).sum::<usize>()
     }
+    /// The memory of bucket b's slots, to be reused once they are read.
+    fn region(&self, b: usize) -> (*mut u8, usize) {
+        // SAFETY: inside the mapping.
+        (unsafe { self.ptr.add(b * self.cap) } as *mut u8, self.cap * std::mem::size_of::<T>())
+    }
+}
+
+/// Values of one thread in blocks of BLOCK, per bucket a current block and
+/// a list of full ones. Blocks come from memory handed over with `donate`
+/// (arena regions already read, so that no fresh pages need zeroing), or
+/// else from fresh mappings.
+struct Blocks<T: Copy> {
+    cur: Vec<(*mut T, u32)>,
+    full: Vec<Vec<*mut T>>,
+    free: Vec<*mut T>,
+    fresh: Vec<memmap2::MmapMut>,
+}
+
+const BLOCK: usize = 64;
+
+unsafe impl<T: Copy + Send> Send for Blocks<T> {}
+unsafe impl<T: Copy + Sync> Sync for Blocks<T> {}
+
+impl<T: Copy> Blocks<T> {
+    fn new(nb: usize) -> Self {
+        Blocks { cur: vec![(std::ptr::null_mut(), BLOCK as u32); nb], full: vec![Vec::new(); nb], free: Vec::new(), fresh: Vec::new() }
+    }
+    /// Hands over [p, p + bytes) for blocks; it must stay mapped while the
+    /// values do, and not be used otherwise.
+    fn donate(&mut self, p: *mut u8, bytes: usize) {
+        let size = BLOCK * std::mem::size_of::<T>();
+        let start = (p as usize).next_multiple_of(std::mem::align_of::<T>());
+        let mut at = start;
+        while at + size <= p as usize + bytes {
+            self.free.push(at as *mut T);
+            at += size;
+        }
+    }
+    #[cold]
+    fn refill(&mut self) {
+        let size = BLOCK * std::mem::size_of::<T>();
+        let mut map = memmap2::MmapMut::map_anon(512 * size).expect("map_anon");
+        #[cfg(target_os = "linux")]
+        let _ = map.advise(memmap2::Advice::HugePage);
+        let p = map.as_mut_ptr();
+        self.fresh.push(map);
+        self.donate(p, 512 * size);
+    }
+    /// The next slot of bucket b, now counted as written.
+    #[inline(always)]
+    fn reserve(&mut self, b: usize) -> *mut T {
+        let (p, n) = self.cur[b];
+        if n as usize == BLOCK {
+            if self.free.is_empty() {
+                self.refill();
+            }
+            let blk = self.free.pop().unwrap();
+            if !p.is_null() {
+                self.full[b].push(p);
+            }
+            self.cur[b] = (blk, 1);
+            return blk;
+        }
+        self.cur[b].1 = n + 1;
+        // SAFETY: n < BLOCK slots in the current block.
+        unsafe { p.add(n as usize) }
+    }
+    /// Bucket b's values, block by block.
+    fn bucket(&self, b: usize) -> impl Iterator<Item = &[T]> + '_ {
+        let (p, n) = self.cur[b];
+        let cur: &[T] = if p.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(p, n as usize) } };
+        // SAFETY: full blocks hold BLOCK written values each.
+        self.full[b].iter().map(|&q| unsafe { std::slice::from_raw_parts(q as *const T, BLOCK) }).chain(std::iter::once(cur))
+    }
 }
 
 /// Arena writes made a few values late: each slot is reserved and prefetched
@@ -281,6 +355,23 @@ impl<T: Copy + Default> Pending<T> {
             }
             None => arena.spill[b].push(v),
         }
+    }
+    /// `push` into blocks.
+    #[inline(always)]
+    fn push_block(&mut self, blocks: &mut Blocks<T>, b: usize, v: T) {
+        let dst = blocks.reserve(b);
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(dst as *const i8, _MM_HINT_T0);
+        }
+        let slot = &mut self.ring[self.n % PENDING];
+        if self.n >= PENDING {
+            // SAFETY: a slot reserved in a live block.
+            unsafe { slot.0.write(slot.1) };
+        }
+        *slot = (dst, v);
+        self.n += 1;
     }
     fn flush(&mut self) {
         for i in self.n.saturating_sub(PENDING)..self.n {
@@ -773,7 +864,7 @@ struct ParseOut {
 }
 
 struct DedupOut {
-    pe: Arena<Pe>,
+    pe: Blocks<Pe>,
     table: Vec<(u64, u64)>,
     filled: Vec<u32>,
     keys: Vec<u64>,
@@ -1113,7 +1204,6 @@ fn main() {
     // Every page of an arena gets touched (and zeroed by the kernel), so
     // the slack costs time. The thread that builds the links parses about a
     // third of a share of events; clicks come in fewer, larger chunks.
-    let per = |est: usize, nb: usize| est * 21 / 20 / nb / nthreads + 16;
     let per_ev = est_ev * 108 / (100 * nthreads - 60).max(100) / nb_ev + 16;
     let per_ck = est_ck * 23 / 20 / nb_p / nthreads + 16;
 
@@ -1160,7 +1250,7 @@ fn main() {
     let table_size = (max_bucket * 2).next_power_of_two().max(16);
     let mut dedup_outs: Vec<DedupOut> = (0..nthreads)
         .map(|_| DedupOut {
-            pe: Arena::new(nb_p, per(n_ev, nb_p)),
+            pe: Blocks::new(nb_p),
             table: Vec::new(),
             filled: Vec::new(),
             keys: Vec::new(),
@@ -1226,9 +1316,15 @@ fn main() {
                 }
             }
             links.resolve(&mut out.keys, &mut out.cand);
+            // The bucket's copies are all read: their memory takes the
+            // survivors, now by person bucket, instead of fresh pages.
+            for po in parse_outs {
+                let (p, bytes) = po.ev.region(b);
+                out.pe.donate(p, bytes);
+            }
             let mut pending = Pending::new();
             for (&person, &(ts, pc)) in out.keys.iter().zip(&out.rest) {
-                pending.push(&mut out.pe, bucket_of(person, p_shift), Pe { person, ts, pc });
+                pending.push_block(&mut out.pe, bucket_of(person, p_shift), Pe { person, ts, pc });
             }
             pending.flush();
         });
@@ -1236,11 +1332,7 @@ fn main() {
     for o in &mut dedup_outs {
         o.table = Vec::new();
     }
-    // Free the event arenas in the background rather than at exit.
-    for o in &mut parse_outs {
-        let ev = std::mem::replace(&mut o.ev, Arena::new(1, 0));
-        std::thread::spawn(move || drop(ev));
-    }
+    // The event arenas now hold the survivors (see Blocks): they stay.
     eprintln!("dedup: {:?}", t_start.elapsed());
 
     // ---- persons
