@@ -1128,9 +1128,21 @@ fn main() {
 }
 
 fn parse_events(chunk: &'static [u8], ctx: &Ctx, shift: u32, out: &mut ParseOut) {
-    let (ws, we, t0) = (ctx.ws, ctx.we, ctx.t0);
     let ParseOut { ev, odd, .. } = out;
-    csv::for_each_line::<7>(chunk, |l| {
+    csv::for_each_line::<7>(chunk, EventSink { ctx, shift, ev, odd });
+}
+
+struct EventSink<'a> {
+    ctx: &'a Ctx,
+    shift: u32,
+    ev: &'a mut Arena<Ev>,
+    odd: &'a mut Vec<(u64, &'static [u8])>,
+}
+
+impl csv::Sink for EventSink<'_> {
+    #[inline(always)]
+    fn line(&mut self, l: &csv::Line) {
+        let ctx = self.ctx;
         let (eid_s, eid_w) = l.get_w(0);
         if eid_s.is_empty() {
             return;
@@ -1141,7 +1153,7 @@ fn parse_events(chunk: &'static [u8], ctx: &Ctx, shift: u32, out: &mut ParseOut)
             e.ingest = ctx.ingest_key(ingest);
             if let Some(t) = parse_ts(l.get(2)) {
                 let (uid, uid_w) = l.get_w(1);
-                if t >= ws && t < we && ingest - t <= DAY && !uid.is_empty() {
+                if t >= ctx.ws && t < ctx.we && ingest - t <= DAY && !uid.is_empty() {
                     let product = l.get(5);
                     let valid = !product.is_empty()
                         && match l.get(4) {
@@ -1157,29 +1169,46 @@ fn parse_events(chunk: &'static [u8], ctx: &Ctx, shift: u32, out: &mut ParseOut)
                             _ => false,
                         };
                     if valid {
-                        e.uid = ids::key_keep_w(uid, uid_w, odd);
-                        e.ts = (t - t0) as u32;
+                        e.uid = ids::key_keep_w(uid, uid_w, self.odd);
+                        e.ts = (t - ctx.t0) as u32;
                     }
                 }
             }
         }
-        ev.push(bucket_of(eid, shift), e);
-    });
+        self.ev.push(bucket_of(eid, self.shift), e);
+    }
 }
 
 fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out: &mut ParseOut) {
-    let (we, t0) = (ctx.we, ctx.t0);
     let ParseOut { ck, odd, scratch, keys, maybe, .. } = out;
     // First the clicks with their user_id key in `person`; then the person
     // lookups, prefetched a few ahead, since the links table is large.
     scratch.clear();
-    csv::for_each_line::<4>(chunk, |l| {
+    csv::for_each_line::<4>(chunk, ClickSink { ctx, scratch, odd });
+    keys.clear();
+    keys.extend(scratch.iter().map(|c| c.person));
+    links.resolve(keys, maybe);
+    for (c, &person) in scratch.iter().zip(keys.iter()) {
+        ck.push(bucket_of(person, shift), Ck { person, ..*c });
+    }
+}
+
+struct ClickSink<'a> {
+    ctx: &'a Ctx,
+    scratch: &'a mut Vec<Ck>,
+    odd: &'a mut Vec<(u64, &'static [u8])>,
+}
+
+impl csv::Sink for ClickSink<'_> {
+    #[inline(always)]
+    fn line(&mut self, l: &csv::Line) {
+        let ctx = self.ctx;
         let ((id, id_w), (user, user_w)) = (l.get_w(0), l.get_w(1));
         if id.is_empty() || user.is_empty() {
             return;
         }
         let t = match parse_ts(l.get(3)) {
-            Some(t) if t >= t0 && t < we => t,
+            Some(t) if t >= ctx.t0 && t < ctx.we => t,
             _ => return,
         };
         let camp_id = l.get(2);
@@ -1190,13 +1219,8 @@ fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out:
             Some(c) => c,
             None => return,
         };
-        scratch.push(Ck { person: ids::key_w(user, user_w), id: ids::key_keep_w(id, id_w, odd), ts: (t - t0) as u32, camp });
-    });
-    keys.clear();
-    keys.extend(scratch.iter().map(|c| c.person));
-    links.resolve(keys, maybe);
-    for (c, &person) in scratch.iter().zip(keys.iter()) {
-        ck.push(bucket_of(person, shift), Ck { person, ..*c });
+        let person = ids::key_w(user, user_w);
+        self.scratch.push(Ck { person, id: ids::key_keep_w(id, id_w, self.odd), ts: (t - ctx.t0) as u32, camp });
     }
 }
 

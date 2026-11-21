@@ -81,8 +81,8 @@ const POS: u32 = NL - 1;
 /// One well-formed line: field i is `get(i)`, unquoted.
 pub struct Line<'a> {
     chunk: &'static [u8],
-    /// [start, end) of each field, quotes already stripped.
-    bounds: &'a [[u32; 2]; 16],
+    /// Each field as start | end << 32, quotes already stripped.
+    bounds: &'a [u64; 16],
 }
 
 /// Bounds of the field [s, e) without its wrapping quotes, branch-free.
@@ -100,58 +100,74 @@ impl Line<'_> {
     #[inline(always)]
     pub fn get_w(&self, i: usize) -> (&'static [u8], bool) {
         let f = self.get(i);
-        (f, self.bounds[i][0] as usize + 16 <= self.chunk.len())
+        (f, self.bounds[i] as u32 as usize + 16 <= self.chunk.len())
     }
 
     /// Field i (i < N).
     #[inline(always)]
     pub fn get(&self, i: usize) -> &'static [u8] {
-        let [s, e] = self.bounds[i];
-        // SAFETY: s <= e <= chunk.len() for the N fields of a line.
-        unsafe { self.chunk.get_unchecked(s as usize..e as usize) }
+        let v = self.bounds[i];
+        // SAFETY: start <= end <= chunk.len() for the N fields of a line.
+        unsafe { self.chunk.get_unchecked(v as u32 as usize..(v >> 32) as usize) }
     }
 }
 
-/// Calls `f` with every well-formed line of N fields in `chunk`. N <= 15.
+/// Receives each well-formed line. A trait method, unlike a closure, can be
+/// forced inline into the scan loop.
+pub trait Sink {
+    fn line(&mut self, l: &Line);
+}
+
+impl<F: FnMut(&Line)> Sink for F {
+    #[inline(always)]
+    fn line(&mut self, l: &Line) {
+        self(l)
+    }
+}
+
+/// The end of a line with `nfields` fields, whose bounds are in `bounds`:
+/// strips and checks the quotes, then passes the line on if well-formed.
 #[inline(always)]
-pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&Line)) {
+fn line_end<const N: usize>(
+    chunk: &'static [u8],
+    bounds: &mut [u64; 16],
+    nfields: usize,
+    quotes: usize,
+    f: &mut impl Sink,
+) {
+    if nfields != N {
+        return;
+    }
+    if quotes != 0 {
+        let mut wrapped = 0;
+        for b in bounds.iter_mut().take(N) {
+            let (fs, fe, q) = unwrap_field(chunk, *b as u32 as usize, (*b >> 32) as usize);
+            *b = fs as u64 | (fe as u64) << 32;
+            wrapped += q;
+        }
+        if 2 * wrapped != quotes {
+            return;
+        }
+    }
+    f.line(&Line { chunk, bounds });
+}
+
+/// Calls `f` with every well-formed line of N fields in `chunk`. N <= 15.
+///
+/// Each field's bounds are stored as one u64 as its separator is found, so
+/// the per-line code reads them back with loads of the same width (a wider
+/// load of several fresh narrow stores stalls on store forwarding).
+#[inline(always)]
+pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl Sink) {
     let len = chunk.len();
     assert!(len < POS as usize, "chunk too large");
     let base = chunk.as_ptr();
-    // ends[i] is where field i ends; field i starts after ends[i-1] (or at line_start).
-    let mut ends = [0u32; 16];
+    let mut bounds = [0u64; 16];
     let mut nsep = 0usize;
-    let mut line_start = 0usize;
+    let mut field_start = 0u64;
     let mut q_before = 0usize; // quotes before the current block
-    let mut q_line = 0usize; // quotes before line_start
+    let mut q_line = 0usize; // quotes before the current line
     let mut tail = [0u8; 64];
-
-    let mut bounds = [[0u32; 2]; 16];
-    let mut emit = |line_start: usize, nfields: usize, ends: &[u32; 16], quotes: usize| {
-        if nfields != N {
-            return;
-        }
-        let mut s = line_start;
-        if quotes == 0 {
-            for i in 0..N {
-                bounds[i] = [s as u32, ends[i]];
-                s = ends[i] as usize + 1;
-            }
-        } else {
-            let mut wrapped = 0;
-            for i in 0..N {
-                let e = ends[i] as usize;
-                let (fs, fe, q) = unwrap_field(chunk, s, e);
-                bounds[i] = [fs as u32, fe as u32];
-                wrapped += q;
-                s = e + 1;
-            }
-            if 2 * wrapped != quotes {
-                return;
-            }
-        }
-        f(&Line { chunk, bounds: &bounds });
-    };
 
     let mut b = 0;
     while b < len {
@@ -165,15 +181,15 @@ pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&Li
         let mut m = sep;
         while m != 0 {
             let tz = m.trailing_zeros() as usize;
-            let p = b + tz;
+            let p = (b + tz) as u64;
             if nsep < 16 {
-                ends[nsep] = p as u32;
+                bounds[nsep] = field_start | p << 32;
             }
             nsep += 1;
+            field_start = p + 1;
             if (nl >> tz) & 1 != 0 {
                 let q_at = q_before + (q & ((1u64 << tz) - 1)).count_ones() as usize;
-                emit(line_start, nsep, &ends, q_at - q_line);
-                line_start = p + 1;
+                line_end::<N>(chunk, &mut bounds, nsep, q_at - q_line, &mut f);
                 q_line = q_at;
                 nsep = 0;
             }
@@ -182,18 +198,18 @@ pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&Li
         q_before += q.count_ones() as usize;
         b += 64;
     }
-    if line_start < len {
+    if (field_start as usize) < len || nsep > 0 {
         if nsep < 16 {
-            ends[nsep] = len as u32;
+            bounds[nsep] = field_start | (len as u64) << 32;
         }
-        emit(line_start, nsep + 1, &ends, q_before - q_line);
+        line_end::<N>(chunk, &mut bounds, nsep + 1, q_before - q_line, &mut f);
     }
 }
 
 /// Calls `f` with the N values of every well-formed line in `chunk`. N <= 15.
 #[inline(always)]
 pub fn for_each<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&[&'static [u8]; N])) {
-    for_each_line::<N>(chunk, |line| f(&std::array::from_fn(|i| line.get(i))));
+    for_each_line::<N>(chunk, |line: &Line| f(&std::array::from_fn(|i| line.get(i))));
 }
 
 #[cfg(test)]
