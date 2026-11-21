@@ -490,7 +490,14 @@ impl Ctx {
     }
     #[inline]
     fn ingest_key(&self, secs: i64) -> u32 {
-        (secs - self.ingest_base).clamp(0, u32::MAX as i64) as u32
+        let d = secs - self.ingest_base;
+        if d as u64 <= u32::MAX as u64 {
+            d as u32
+        } else if d < 0 {
+            0
+        } else {
+            u32::MAX
+        }
     }
     #[inline]
     fn day_of(&self, rel: u32) -> usize {
@@ -603,6 +610,19 @@ fn release(chunk: &[u8]) {
     if end > start {
         // SAFETY: the range is inside a live read-only file mapping.
         unsafe { madvise(start as *mut std::ffi::c_void, end - start, MADV_DONTNEED) };
+    }
+}
+
+/// Maps the pages of `chunk` (a file mapping) in one call, instead of a
+/// fault per 64 KB. Kernels before 5.14 refuse; the pages then fault in.
+fn populate(chunk: &[u8]) {
+    const PAGE: usize = 4096;
+    const MADV_POPULATE_READ: i32 = 22;
+    let start = (chunk.as_ptr() as usize) & !(PAGE - 1);
+    let end = chunk.as_ptr() as usize + chunk.len();
+    if end > start {
+        // SAFETY: the range is inside a live read-only file mapping.
+        unsafe { madvise(start as *mut std::ffi::c_void, end - start, MADV_POPULATE_READ) };
     }
 }
 
@@ -919,11 +939,16 @@ fn radix_pass(src: &[Tp], dst: &mut Vec<Tp>, at: &mut [u32], key: impl Fn(u32) -
     dst.clear();
     dst.reserve(src.len());
     let out = dst.as_mut_ptr();
+    assert_eq!(at.len(), DIGIT);
     for t in src {
         let k = key(t.ts) & (DIGIT - 1);
-        // SAFETY: the places of all keys are below src.len().
-        unsafe { out.add(at[k] as usize).write(*t) };
-        at[k] += 1;
+        // SAFETY: k < DIGIT = at.len(); the places of all keys are below
+        // src.len().
+        unsafe {
+            let c = at.get_unchecked_mut(k);
+            out.add(*c as usize).write(*t);
+            *c += 1;
+        }
     }
     // SAFETY: every place in 0..len was written once.
     unsafe { dst.set_len(src.len()) };
@@ -972,10 +997,14 @@ impl Group {
                     }
                     i = (i + 1) & mask;
                 };
-                self.starts[id as usize + 1] += 1;
-                hist[e.ts as usize & (DIGIT - 1)] += 1;
-                hist[DIGIT + (e.ts as usize >> 11 & (DIGIT - 1))] += 1;
-                hist[2 * DIGIT + (e.ts as usize >> 22)] += 1;
+                // SAFETY: id < np < starts.len(); ts < 2^31, so every digit
+                // index is below 3 * DIGIT = hist.len().
+                unsafe {
+                    *self.starts.get_unchecked_mut(id as usize + 1) += 1;
+                    *hist.get_unchecked_mut(e.ts as usize & (DIGIT - 1)) += 1;
+                    *hist.get_unchecked_mut(DIGIT + (e.ts as usize >> 11 & (DIGIT - 1))) += 1;
+                    *hist.get_unchecked_mut(2 * DIGIT + (e.ts as usize >> 22)) += 1;
+                }
                 self.evs.push(Tp { ts: e.ts, pc: e.pc, id });
             }
         }
@@ -1226,10 +1255,12 @@ fn main() {
             eprintln!("links built: {:?}", t_parse.elapsed());
             let _ = links.set(l);
         } else if i <= n_ev_chunks {
+            populate(ev_chunks[i - 1]);
             parse_events(ev_chunks[i - 1], ctx, ev_shift, out);
             release(ev_chunks[i - 1]);
         } else {
             let links = links.wait();
+            populate(ck_chunks[i - 1 - n_ev_chunks]);
             parse_clicks(ck_chunks[i - 1 - n_ev_chunks], ctx, links, p_shift, out);
             release(ck_chunks[i - 1 - n_ev_chunks]);
         }
