@@ -81,10 +81,8 @@ const POS: u32 = NL - 1;
 /// One well-formed line: field i is `get(i)`, unquoted.
 pub struct Line<'a> {
     chunk: &'static [u8],
-    start: usize,
-    /// At least N separator positions; a position may carry the NL tag.
-    ends: &'a [u32],
-    quoted: bool,
+    /// [start, end) of each field, quotes already stripped.
+    bounds: &'a [[u32; 2]; 16],
 }
 
 /// Bounds of the field [s, e) without its wrapping quotes, branch-free.
@@ -101,17 +99,9 @@ impl Line<'_> {
     /// Field i (i < N).
     #[inline(always)]
     pub fn get(&self, i: usize) -> &'static [u8] {
-        // SAFETY: i < N <= ends.len().
-        let s = if i == 0 { self.start } else { (unsafe { *self.ends.get_unchecked(i - 1) } & POS) as usize + 1 };
-        let e = (unsafe { *self.ends.get_unchecked(i) } & POS) as usize;
-        let (s, e) = if self.quoted {
-            let (s, e, _) = unwrap_field(self.chunk, s, e);
-            (s, e)
-        } else {
-            (s, e)
-        };
-        // SAFETY: s <= e <= chunk.len().
-        unsafe { self.chunk.get_unchecked(s..e) }
+        let [s, e] = self.bounds[i];
+        // SAFETY: s <= e <= chunk.len() for the N fields of a line.
+        unsafe { self.chunk.get_unchecked(s as usize..e as usize) }
     }
 }
 
@@ -129,23 +119,31 @@ pub fn for_each_line<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&Li
     let mut q_line = 0usize; // quotes before line_start
     let mut tail = [0u8; 64];
 
+    let mut bounds = [[0u32; 2]; 16];
     let mut emit = |line_start: usize, nfields: usize, ends: &[u32; 16], quotes: usize| {
         if nfields != N {
             return;
         }
-        if quotes != 0 {
+        let mut s = line_start;
+        if quotes == 0 {
+            for i in 0..N {
+                bounds[i] = [s as u32, ends[i]];
+                s = ends[i] as usize + 1;
+            }
+        } else {
             let mut wrapped = 0;
-            let mut s = line_start;
-            for &e in &ends[..N] {
-                let e = e as usize;
-                wrapped += unwrap_field(chunk, s, e).2;
+            for i in 0..N {
+                let e = ends[i] as usize;
+                let (fs, fe, q) = unwrap_field(chunk, s, e);
+                bounds[i] = [fs as u32, fe as u32];
+                wrapped += q;
                 s = e + 1;
             }
             if 2 * wrapped != quotes {
                 return;
             }
         }
-        f(&Line { chunk, start: line_start, ends, quoted: quotes != 0 });
+        f(&Line { chunk, bounds: &bounds });
     };
 
     let mut b = 0;

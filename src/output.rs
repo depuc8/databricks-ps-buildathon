@@ -372,11 +372,11 @@ pub fn write_all(out: &Path, ctx: &Ctx, odd: &Odd, parts: &mut [PersonOut]) {
         let nd = ctx.ndays;
         let mut total = vec![CampStat::default(); (ctx.organic() + 1) * nd];
         for p in parts.iter() {
-            for (t, s) in total.iter_mut().zip(&p.camps) {
-                t.sessions += s.sessions;
-                t.purchasing += s.purchasing;
-                t.revenue += s.revenue;
-                t.assisted += s.assisted;
+            for ((t, c), &a) in total.iter_mut().zip(&p.credit).zip(&p.assisted) {
+                t.sessions += c.sessions as i64;
+                t.purchasing += c.purchasing as i64;
+                t.revenue += c.revenue as i64;
+                t.assisted += a as i64;
             }
         }
         let mut rows = Vec::new();

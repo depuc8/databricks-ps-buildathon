@@ -1,10 +1,11 @@
 //! IDs as u64 keys.
 //!
-//! An ID of 1 to 10 ASCII letters and digits (every ID the generator writes)
-//! packs exactly into 60 bits, 6 bits a character, left-aligned, with codes in
-//! ASCII order, so packed keys compare like the strings, byte by byte. Any
-//! other ID (spaces, tabs, `\r`, other punctuation, longer) is "odd": its key
-//! is the top bit plus a 63-bit hash, and its bytes are kept in a side table.
+//! An ID of 1 to 10 ASCII letters, digits and `_` (every ID the generator
+//! writes, campaign and product IDs too) packs exactly into 60 bits, 6 bits a
+//! character, left-aligned, with codes in ASCII order, so packed keys compare
+//! like the strings, byte by byte. Any other ID (spaces, tabs, `\r`, other
+//! punctuation, longer) is "odd": its key is the top bit plus a 63-bit hash,
+//! and its bytes are kept in a side table.
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -21,7 +22,7 @@ const fn build_codes() -> [u8; 256] {
     let mut code = 1;
     while c < 256 {
         let b = c as u8;
-        if b.is_ascii_digit() || b.is_ascii_uppercase() || b.is_ascii_lowercase() {
+        if b.is_ascii_digit() || b.is_ascii_uppercase() || b == b'_' || b.is_ascii_lowercase() {
             t[c] = code;
             code += 1;
         }
@@ -133,7 +134,8 @@ mod tests {
     #[test]
     fn packing_keeps_order_and_bytes() {
         let odd = Odd::default();
-        let words: [&[u8]; 9] = [b"0", b"U1", b"u", b"u1", b"u10", b"u1a", b"u2", b"zzzzzzzzzz", b"A"];
+        let words: [&[u8]; 13] =
+            [b"0", b"U1", b"u", b"u1", b"u10", b"u1a", b"u2", b"zzzzzzzzzz", b"A", b"c_1", b"c_10", b"cZ", b"ca"];
         for a in words {
             let ka = pack(a).unwrap();
             let mut buf = [0u8; 10];
@@ -142,7 +144,7 @@ mod tests {
                 assert_eq!(ka.cmp(&pack(b).unwrap()), a.cmp(b), "{a:?} {b:?}");
             }
         }
-        for s in [&b" u1"[..], b"u1 ", b"u1\r", b"A\tB", b"user_id_a", b"abcdefghijk", "٢".as_bytes()] {
+        for s in [&b" u1"[..], b"u1 ", b"u1\r", b"A\tB", b"user-id", b"abcdefghijk", "٢".as_bytes()] {
             assert!(pack(s).is_none());
             assert_ne!(key(s) & ODD, 0);
         }
