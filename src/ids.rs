@@ -40,22 +40,24 @@ fn pack(s: &[u8]) -> Option<u64> {
 #[cfg(target_feature = "bmi2")]
 #[inline(always)]
 unsafe fn pack_wide(s: &[u8]) -> Option<u64> {
-    use std::arch::x86_64::_pext_u64;
+    use std::arch::x86_64::{_bzhi_u64, _pext_u64};
     let n = s.len();
-    if n == 0 || n > 9 {
+    if n.wrapping_sub(1) > 8 {
         return None;
     }
     let p = s.as_ptr();
-    let keep = if n >= 8 { u64::MAX } else { !(u64::MAX >> (8 * n)) };
-    let a = u64::from_be_bytes((p as *const [u8; 8]).read_unaligned()) & keep;
-    let b = if n == 9 { *p.add(8) as u64 } else { 0 };
-    // ASCII, and no NUL inside: the first zero byte of `a` is at or past n.
-    let zero = a.wrapping_sub(0x0101_0101_0101_0101) & !a & 0x8080_8080_8080_8080;
-    let first_zero = (zero.leading_zeros() / 8) as usize;
-    if (a | b) & 0x8080_8080_8080_8080 != 0 || first_zero < n.min(8) || (n == 9 && b == 0) {
+    // Little-endian: byte 0 is the first character. BZHI keeps the first n
+    // bytes (all 8 when n >= 8).
+    let raw = (p as *const u64).read_unaligned();
+    let bits = 8 * n as u32;
+    // Bit 7 of a byte: a non-ASCII byte, or the first NUL (a borrow can only
+    // mark bytes after a real NUL).
+    let bad = _bzhi_u64((raw.wrapping_sub(0x0101_0101_0101_0101) & !raw | raw) & 0x8080_8080_8080_8080, bits);
+    let b = *p.add(8) as u64 & (n == 9) as u64 * 0xff;
+    if bad != 0 || (n == 9 && b.wrapping_sub(1) >= 0x7f) {
         return None;
     }
-    Some(_pext_u64(a, 0x7f7f_7f7f_7f7f_7f7f) << 7 | b)
+    Some(_pext_u64(_bzhi_u64(raw, bits).swap_bytes(), 0x7f7f_7f7f_7f7f_7f7f) << 7 | b)
 }
 
 #[cfg(not(target_feature = "bmi2"))]

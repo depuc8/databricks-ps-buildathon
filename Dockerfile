@@ -5,7 +5,7 @@ FROM rust:1.90-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim

@@ -188,6 +188,7 @@ pub const fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// gets its day count from the table. Every other timestamp goes through the
 /// full parser, so the results never depend on the table.
 pub struct Fast {
+    /// Indexed by month % 4: four consecutive months fill the four slots.
     keys: [u64; 4],
     /// Seconds from the epoch to the day before the 1st of the month.
     base: [i64; 4],
@@ -199,7 +200,8 @@ impl Fast {
     pub fn new(from_ms: i64) -> Fast {
         let (mut y, mut m, _) = civil_from_days(from_ms.div_euclid(86_400_000));
         let mut f = Fast { keys: [0; 4], base: [0; 4], len: [0; 4] };
-        for i in 0..4 {
+        for _ in 0..4 {
+            let i = (m % 4) as usize;
             if (0..=9999).contains(&y) {
                 let key = format!("{y:04}-{m:02}-");
                 f.keys[i] = u64::from_le_bytes(key.as_bytes().try_into().unwrap());
@@ -229,10 +231,7 @@ impl Fast {
     #[inline(always)]
     pub fn ingest_secs(&self, s: &[u8]) -> Option<i64> {
         if s.len() == 20 {
-            let a = load8(s, 0);
-            let hit = [a == self.keys[0], a == self.keys[1], a == self.keys[2], a == self.keys[3]];
-            if hit[0] | hit[1] | hit[2] | hit[3] {
-                let i = hit[1] as usize | (hit[2] as usize) << 1 | (hit[3] as usize) * 3;
+            if let Some(i) = self.slot(load8(s, 0)) {
                 let x = load8(s, 8); // DDTHH:MM
                 let pd = pairs(load8(s, 11), 0xffff_00ff_ff00_ffff); // HH:MM:SS
                 let day = (x & 0xf) * 10 + (x >> 8 & 0xf);
@@ -259,39 +258,36 @@ impl Fast {
         }
     }
 
+    /// The table slot of a date whose first 8 bytes are `a`, if its
+    /// `YYYY-MM-` is in the table.
+    #[inline(always)]
+    fn slot(&self, a: u64) -> Option<usize> {
+        // Bytes 5 and 6 are the month's digits ('0' or '1', then '0'..'9').
+        let i = ((a >> 40 & 1) * 10 + (a >> 48 & 0xf)) as usize & 3;
+        if a == self.keys[i] {
+            Some(i)
+        } else {
+            None
+        }
+    }
+
     /// `parse_iso` for s of length 20 or 25.
     #[inline(always)]
     fn iso(&self, s: &[u8]) -> Option<i64> {
-        let a = load8(s, 0); // YYYY-MM-
-        let hit = [a == self.keys[0], a == self.keys[1], a == self.keys[2], a == self.keys[3]];
-        if !(hit[0] | hit[1] | hit[2] | hit[3]) {
+        let Some(i) = self.slot(load8(s, 0)) else {
             return parse_iso(s);
-        }
-        let i = hit[1] as usize | (hit[2] as usize) << 1 | (hit[3] as usize) * 3;
-        let x = load8(s, 8); // DDTHH:MM
-        let d = load8(s, 11); // HH:MM:SS
-        const D_DIG: u64 = 0xffff_00ff_ff00_ffff;
-        const D_SEP: u64 = 0x0000_ff00_00ff_0000;
-        if !all_digits(x, 0xffff) || (x >> 16) as u8 != b'T' || !all_digits(d, D_DIG) || d & D_SEP != 0x0000_3a00_003a_0000 {
-            return None;
-        }
-        let day = (x & 0xf) * 10 + (x >> 8 & 0xf);
-        // Bytes 0, 3 and 6: hour, minute, second; each byte at most 99, so
-        // adding 127 - limit sets its top bit exactly when over the limit.
-        let pd = pairs(d, D_DIG) & 0x00ff_0000_ff00_00ff;
-        if pd.wrapping_add(104 | 68 << 24 | 68 << 48) & 0x0080_0000_8000_0080 != 0 || day == 0 || day > self.len[i] {
-            return None;
-        }
-        let t = self.base[i] + (day * 86_400 + (pd & 0xff) * 3600 + (pd >> 24 & 0xff) * 60 + (pd >> 48)) as i64;
-        let zone = s[19];
-        if s.len() == 20 {
-            return if zone == b'Z' { Some(t) } else { None };
-        }
-        let sign = match zone {
-            b'+' => 1,
-            b'-' => -1,
-            _ => return None,
         };
+        let f2 = s.len() == 25;
+        // SAFETY: s has at least 20 bytes.
+        let (day, secs) = unsafe { day_secs(s.as_ptr(), f2) }?;
+        if day == 0 || day > self.len[i] {
+            return None;
+        }
+        let t = self.base[i] + (day * 86_400 + secs) as i64;
+        if !f2 {
+            return Some(t);
+        }
+        let sign = if s[19] == b'+' { 1 } else { -1 };
         let o = load8(s, 17); // SS+HH:MM
         const O_DIG: u64 = 0xffff_00ff_ff00_0000;
         if !all_digits(o, O_DIG) || (o >> 40) as u8 != b':' {
@@ -304,6 +300,59 @@ impl Fast {
         }
         Some(t - sign * (oh * 60 + om) * 60)
     }
+}
+
+/// Checks bytes 4..20 of an F1 (or, if `f2`, F2) timestamp at p, the part
+/// after the year: `-MM-DDTHH:MM:SSZ` (or a sign for the Z), digits where
+/// digits go and hours, minutes and seconds in range. Returns the day of the
+/// month (unchecked) and the seconds into the day.
+///
+/// # Safety
+/// 20 bytes from p must be readable.
+#[cfg(target_feature = "sse4.1")]
+#[inline(always)]
+unsafe fn day_secs(p: *const u8, f2: bool) -> Option<(u64, u64)> {
+    use std::arch::x86_64::*;
+    // Each byte minus its base must be at most its limit: digits are
+    // '0' + 9, separators exact, and F2's sign '+' + 2 (no field holds the
+    // ',' between '+' and '-').
+    const BASE: [[u8; 16]; 2] = [*b"-00-00T00:00:00Z", *b"-00-00T00:00:00+"];
+    const LIMIT: [[u8; 16]; 2] = [[0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0], [0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 2]];
+    let x = _mm_sub_epi8(_mm_loadu_si128(p.add(4) as *const __m128i), _mm_loadu_si128(BASE[f2 as usize].as_ptr() as *const __m128i));
+    let lim = _mm_loadu_si128(LIMIT[f2 as usize].as_ptr() as *const __m128i);
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(x, lim), x)) != 0xffff {
+        return None;
+    }
+    // The digit pairs of day, hour, minute, second, as four 16-bit values.
+    let g = _mm_shuffle_epi8(x, _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1));
+    let t = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+    if _mm_movemask_epi8(_mm_cmpgt_epi16(t, _mm_setr_epi16(31, 23, 59, 59, 99, 99, 99, 99))) != 0 {
+        return None;
+    }
+    let w = _mm_cvtsi128_si64(t) as u64;
+    Some((w & 0xffff, (w >> 16 & 0xffff) * 3600 + (w >> 32 & 0xffff) * 60 + (w >> 48)))
+}
+
+#[cfg(not(target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn day_secs(p: *const u8, f2: bool) -> Option<(u64, u64)> {
+    let s = std::slice::from_raw_parts(p, 20);
+    let x = load8(s, 8); // DDTHH:MM
+    let d = load8(s, 11); // HH:MM:SS
+    const D_DIG: u64 = 0xffff_00ff_ff00_ffff;
+    const D_SEP: u64 = 0x0000_ff00_00ff_0000;
+    if !all_digits(x, 0xffff) || (x >> 16) as u8 != b'T' || !all_digits(d, D_DIG) || d & D_SEP != 0x0000_3a00_003a_0000 {
+        return None;
+    }
+    let zone_ok = if f2 { s[19] == b'+' || s[19] == b'-' } else { s[19] == b'Z' };
+    if !zone_ok {
+        return None;
+    }
+    let pd = pairs(d, D_DIG) & 0x00ff_0000_ff00_00ff;
+    if pd.wrapping_add(104 | 68 << 24 | 68 << 48) & 0x0080_0000_8000_0080 != 0 {
+        return None;
+    }
+    Some(((x & 0xf) * 10 + (x >> 8 & 0xf), (pd & 0xff) * 3600 + (pd >> 24 & 0xff) * 60 + (pd >> 48)))
 }
 
 /// An F3 timestamp (digits only) with SSE: `parse_ts` for anything else.

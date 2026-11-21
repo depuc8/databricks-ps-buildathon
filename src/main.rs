@@ -169,40 +169,35 @@ impl<T: Copy> std::ops::DerefMut for Zeroed<T> {
     }
 }
 
-/// A blocked Bloom filter: each key sets 4 bits within one 512-bit block,
-/// so a query reads one cache line.
+/// A register-blocked Bloom filter: each key sets 4 bits of one 64-bit
+/// word, so a query is one load and one compare.
 struct Bloom {
     bits: Zeroed<u64>,
     mask: usize,
 }
 
 impl Bloom {
-    /// About 8 to 16 bits per key.
+    /// About 12 to 24 bits per key.
     fn new(n: usize) -> Self {
-        let blocks = (n * 8 / 512 + 1).next_power_of_two();
-        Bloom { bits: Zeroed::new(blocks * 8), mask: blocks - 1 }
+        let words = (n * 12 / 64 + 1).next_power_of_two();
+        Bloom { bits: Zeroed::new(words), mask: words - 1 }
     }
+    /// The word of k and its 4 bits.
     #[inline(always)]
-    fn spots(&self, k: u64) -> (usize, [u32; 4]) {
+    fn spot(&self, k: u64) -> (usize, u64) {
         let h = fmix64(k ^ 0x5851_f42d_4c95_7f2d);
-        let block = (h as usize & self.mask) * 8;
-        (block, [(h >> 28) as u32 & 511, (h >> 37) as u32 & 511, (h >> 46) as u32 & 511, (h >> 55) as u32 & 511])
+        (h as usize & self.mask, 1 << (h >> 40 & 63) | 1 << (h >> 46 & 63) | 1 << (h >> 52 & 63) | 1 << (h >> 58))
     }
     fn insert(&mut self, k: u64) {
-        let (block, spots) = self.spots(k);
-        for b in spots {
-            self.bits[block + (b >> 6) as usize] |= 1 << (b & 63);
-        }
+        let (w, pattern) = self.spot(k);
+        self.bits[w] |= pattern;
     }
     #[inline(always)]
     fn maybe(&self, k: u64) -> bool {
-        let (block, spots) = self.spots(k);
-        let mut all = true;
-        for b in spots {
-            // SAFETY: block + 7 < bits.len().
-            all &= unsafe { *self.bits.get_unchecked(block + (b >> 6) as usize) } >> (b & 63) & 1 != 0;
-        }
-        all
+        let (w, pattern) = self.spot(k);
+        // SAFETY: w <= mask < bits.len().
+        let word = unsafe { *self.bits.get_unchecked(w) };
+        word & pattern == pattern
     }
 }
 
@@ -393,7 +388,7 @@ impl Ctx {
     }
     /// The index of a campaign, given whether 16 bytes from its start are
     /// readable.
-    #[inline]
+    #[inline(always)]
     fn campaign(&self, id: &[u8], wide: bool) -> Option<u32> {
         let k = ids::key_w(id, wide);
         if k & ids::ODD == 0 {
@@ -612,9 +607,18 @@ fn bits_for(n: usize, per_bucket: usize, lo: u32, hi: u32) -> u32 {
     want.clamp(lo, hi)
 }
 
+/// The bucket of a key: the top bits of a multiplicative hash.
 #[inline]
 fn bucket_of(k: u64, shift: u32) -> usize {
-    (fmix64(k) >> shift) as usize
+    (k.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize
+}
+
+/// The home slot of a key in a table of 2^(64 - shift) slots for one
+/// bucket's keys: the top bits of another multiplicative hash (the keys of
+/// a bucket share the top bits of the first).
+#[inline(always)]
+fn slot_of(k: u64, shift: u32) -> usize {
+    (k.wrapping_mul(0xd6e8_feb8_6659_fd93) >> shift) as usize
 }
 
 // ---------------------------------------------------------------- links
@@ -787,10 +791,6 @@ struct Group {
 }
 
 impl Group {
-    #[inline]
-    fn slot(person: u64, mask: usize) -> usize {
-        fmix64(person ^ 0x6a09_e667_f3bc_c909) as usize & mask
-    }
 
     /// Fills evs/starts and cks/ck_starts: person p owns
     /// evs[starts[p]..starts[p + 1]] sorted by ts, and the same range of cks
@@ -799,7 +799,7 @@ impl Group {
     fn build(&mut self, ev_parts: &[&[Pe]], ck_parts: &[&[Ck]], odd: &Odd) {
         let n: usize = ev_parts.iter().map(|p| p.len()).sum();
         let size = (n * 2).next_power_of_two().max(16);
-        let mask = size - 1;
+        let (mask, shift) = (size - 1, 64 - size.trailing_zeros());
         if self.table.len() < size {
             self.table.resize(size, (0, 0));
         }
@@ -809,7 +809,7 @@ impl Group {
         self.filled.clear();
         for part in ev_parts {
             for e in *part {
-                let mut i = Self::slot(e.person, mask);
+                let mut i = slot_of(e.person, shift);
                 let id = loop {
                     let (k, v) = table[i];
                     if k == e.person {
@@ -839,7 +839,7 @@ impl Group {
         self.ck_local.clear();
         for part in ck_parts {
             for c in *part {
-                let mut i = Self::slot(c.person, mask);
+                let mut i = slot_of(c.person, shift);
                 let id = loop {
                     let (k, v) = table[i];
                     if k == c.person {
@@ -1105,7 +1105,7 @@ fn main() {
             }
             let n: usize = parts[..nparts].iter().map(|p| p.len()).sum();
             let size = (n * 2).next_power_of_two().max(16);
-            let mask = size - 1;
+            let (mask, shift) = (size - 1, 64 - size.trailing_zeros());
             let table = &mut out.table[..size];
             // A slot holds eid and tag = ingest << 32 | part << 26 | index;
             // `filled` lists the slots in use, so only they are read and reset.
@@ -1113,7 +1113,7 @@ fn main() {
             for (pi, part) in parts[..nparts].iter().enumerate() {
                 for (j, e) in part.iter().enumerate() {
                     let tag = (e.ingest as u64) << 32 | (pi as u64) << 26 | j as u64;
-                    let mut i = fmix64(e.eid) as usize & mask;
+                    let mut i = slot_of(e.eid, shift);
                     loop {
                         let s = &mut table[i];
                         if s.0 == 0 {
@@ -1137,7 +1137,8 @@ fn main() {
             for &i in &out.filled {
                 let tag = table[i as usize].1;
                 table[i as usize] = (0, 0);
-                let e = &parts[(tag >> 26 & 63) as usize][(tag & ((1 << 26) - 1)) as usize];
+                // SAFETY: the tag names a copy of this bucket.
+                let e = unsafe { parts.get_unchecked((tag >> 26 & 63) as usize).get_unchecked((tag & ((1 << 26) - 1)) as usize) };
                 if e.uid != 0 {
                     out.keys.push(e.uid);
                     out.rest.push((e.ts, e.pc));

@@ -76,10 +76,8 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
 /// One well-formed line: field i is `get(i)`, unquoted.
 pub struct Line<'a> {
     chunk: &'static [u8],
-    /// Separator positions; the line's are ring[first..first + N] (mod 64),
-    /// and ring[first - 1] is the newline before it.
-    ring: &'a [u32; 64],
-    first: usize,
+    /// The newline before the line, then the line's N separators.
+    seps: &'a [u32],
 }
 
 impl Line<'_> {
@@ -93,11 +91,13 @@ impl Line<'_> {
     /// Field i (i < N).
     #[inline(always)]
     pub fn get(&self, i: usize) -> &'static [u8] {
-        let s = self.ring[(self.first + i).wrapping_sub(1) & 63].wrapping_add(1) as usize;
-        let e = self.ring[(self.first + i) & 63] as usize;
-        // SAFETY: s <= e < chunk.len(), e being a separator. A field that
-        // starts with a quote is wrapped in quotes: the line passed the check.
+        debug_assert!(i + 1 < self.seps.len());
+        // SAFETY: i < N, so both entries exist; s <= e < chunk.len(), e
+        // being a separator. A field that starts with a quote is wrapped in
+        // quotes: the line passed the check.
         unsafe {
+            let s = self.seps.get_unchecked(i).wrapping_add(1) as usize;
+            let e = *self.seps.get_unchecked(i + 1) as usize;
             let q = (*self.chunk.get_unchecked(s) == b'"') as usize;
             self.chunk.get_unchecked(s + q..e - q)
         }
@@ -117,7 +117,15 @@ impl<F: FnMut(&Line)> Sink for F {
     }
 }
 
-/// XOR of bits 0..=i of x, in bit i.
+/// XOR of bits 0..=i of x, in bit i: a carry-less multiply by all ones.
+#[cfg(target_feature = "pclmulqdq")]
+#[inline(always)]
+fn prefix_xor(x: u64) -> u64 {
+    use std::arch::x86_64::*;
+    unsafe { _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(x as i64), _mm_set1_epi8(-1))) as u64 }
+}
+
+#[cfg(not(target_feature = "pclmulqdq"))]
 #[inline(always)]
 fn prefix_xor(mut x: u64) -> u64 {
     x ^= x << 1;
@@ -163,10 +171,13 @@ fn scan<const N: usize>(chunk: &'static [u8], f: &mut impl Sink) {
     let len = chunk.len();
     assert!(len < u32::MAX as usize, "chunk too large");
     let base = chunk.as_ptr();
-    let mut ring = [0u32; 64];
-    ring[63] = u32::MAX; // the newline before the chunk
-    let mut w = 0usize; // separators so far
-    let mut line = 0usize; // separators before the line in progress
+    // Separator positions in order, from the newline before the chunk. When
+    // full, the entries of the line in progress move to the front.
+    const SEPS: usize = 1024;
+    let mut pos = [0u32; SEPS];
+    pos[0] = u32::MAX; // the newline before the chunk
+    let mut w = 1usize; // entries in pos
+    let mut line = 1usize; // the first entry of the line in progress
     let mut par = 0u64; // all ones after an odd number of quotes
     let mut borrow = 0u64; // the line in progress started at parity 1
     let mut sep_hi = 1u64; // a field starts at the next block's byte 0
@@ -196,16 +207,28 @@ fn scan<const N: usize>(chunk: &'static [u8], f: &mut impl Sink) {
         let mut bad = (q & parity & !starts) | ((close << 1 | close_hi) & !sep) | (sep & parity);
         close_hi = close >> 63;
 
-        // Every separator position goes to the ring, eight unconditionally.
+        if w > SEPS - 72 {
+            // A line already past N separators is dropped anyway: restart
+            // it here, marked bad.
+            if w - line > N {
+                bad_open = true;
+                line = w;
+            }
+            pos.copy_within(line - 1..w, 0);
+            w -= line - 1;
+            line = 1;
+        }
+        // Every separator position goes to pos, eight unconditionally.
         let cnt = sep.count_ones() as usize;
         let mut m = sep;
-        for k in 0..8 {
-            ring[(w + k) & 63] = (b as u32).wrapping_add(m.trailing_zeros());
+        let out: &mut [u32; 72] = (&mut pos[w..w + 72]).try_into().unwrap();
+        for slot in out.iter_mut().take(8) {
+            *slot = (b as u32).wrapping_add(m.trailing_zeros());
             m &= m.wrapping_sub(1);
         }
         let mut k = 8;
         while m != 0 {
-            ring[(w + k) & 63] = b as u32 + m.trailing_zeros();
+            out[k & 63] = b as u32 + m.trailing_zeros();
             m &= m - 1;
             k += 1;
         }
@@ -214,7 +237,7 @@ fn scan<const N: usize>(chunk: &'static [u8], f: &mut impl Sink) {
             let upto = (2u64 << n.trailing_zeros()).wrapping_sub(1);
             let end = w + (sep & upto).count_ones() as usize;
             if end - line == N && !bad_open && bad & upto == 0 {
-                f.line(&Line { chunk, ring: &ring, first: line });
+                f.line(&Line { chunk, seps: &pos[line - 1..end] });
             }
             bad &= !upto;
             bad_open = false;
