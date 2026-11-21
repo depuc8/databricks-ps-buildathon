@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::io::{IoSlice, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::ids::{self, Odd};
 use crate::{CampStat, Ctx, PersonOut};
@@ -481,26 +481,30 @@ fn campaign_file(path: &Path, rows: &[CampRow]) {
     write_file(path, &specs, &[&id, &channel, &day, &sessions, &purchasing, &revenue, &assisted], rows.len());
 }
 
-pub fn write_all(out: &Path, ctx: &Ctx, parts: &mut [PersonOut]) {
+/// Makes the two output folders: user_daily, campaign_daily.
+pub fn make_dirs(out: &Path) -> (PathBuf, PathBuf) {
     let user_dir = out.join("user_daily");
     let camp_dir = out.join("campaign_daily");
     fs::create_dir_all(&user_dir).expect("mkdir user_daily");
     fs::create_dir_all(&camp_dir).expect("mkdir campaign_daily");
+    (user_dir, camp_dir)
+}
 
-    std::thread::scope(|sc| {
-        // One file per thread's rows; at least one file even if all are empty.
-        let last = parts.len().saturating_sub(1);
-        let mut wrote_any = false;
-        for (i, p) in parts.iter().enumerate() {
-            if p.users.len() == 0 && (wrote_any || i < last) {
-                continue;
-            }
-            wrote_any = true;
-            let path = user_dir.join(format!("part-{i:05}.parquet"));
-            let cols = &p.users;
-            sc.spawn(move || user_file(&path, cols));
-        }
+/// Writes thread i's user_daily rows, if any, as soon as its part of the
+/// persons phase is done.
+pub fn write_users(user_dir: &Path, i: usize, cols: &UserCols) {
+    if cols.len() > 0 {
+        user_file(&user_dir.join(format!("part-{i:05}.parquet")), cols);
+    }
+}
 
+/// Writes campaign_daily, and an empty user_daily file if no thread had
+/// rows (the folder must hold at least one file).
+pub fn write_rest(user_dir: &Path, camp_dir: &Path, ctx: &Ctx, parts: &[PersonOut]) {
+    if parts.iter().all(|p| p.users.len() == 0) {
+        user_file(&user_dir.join("part-00000.parquet"), &UserCols::default());
+    }
+    {
         // Campaign stats are summed over threads; one small file.
         let nd = ctx.ndays;
         let mut total = vec![CampStat::default(); (ctx.organic() + 1) * nd];
@@ -524,7 +528,7 @@ pub fn write_all(out: &Path, ctx: &Ctx, parts: &mut [PersonOut]) {
             }
         }
         campaign_file(&camp_dir.join("part-00000.parquet"), &rows);
-    });
+    }
 }
 
 #[cfg(test)]

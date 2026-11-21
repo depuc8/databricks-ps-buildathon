@@ -430,9 +430,19 @@ impl PartMap {
         let m = self.mask[p] as usize;
         (self.base[p] as usize, m, h as usize & m)
     }
+    /// The value of k, probing from its home slot `at` (= base + offset).
     #[inline]
-    fn get(&self, k: u64) -> Option<u64> {
+    fn get_from(&self, k: u64, at: usize) -> Option<u64> {
+        let (sk, sv) = self.slots[at];
+        if sk == k {
+            return Some(sv);
+        }
+        if sk == 0 {
+            return None;
+        }
+        // Past the home slot: find the part to wrap around in it.
         let (b, m, mut i) = self.home(k);
+        i = (i + 1) & m;
         loop {
             let (sk, sv) = self.slots[b + i];
             if sk == k {
@@ -451,15 +461,6 @@ impl PartMap {
         }
         self.slots[b + i] = (k, v);
     }
-    #[inline]
-    fn prefetch(&self, k: u64) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            let (b, _, i) = self.home(k);
-            _mm_prefetch(self.slots.as_ptr().add(b + i) as *const i8, _MM_HINT_T0);
-        }
-    }
 }
 
 /// Every linked ID whose person is named by another ID -> that name.
@@ -471,25 +472,26 @@ struct Links {
 }
 
 impl Links {
-    /// Replaces each user_id key in `keys` by its person, with the table
-    /// lookups prefetched a few ahead. `maybe` is scratch.
-    fn resolve(&self, keys: &mut [u64], maybe: &mut Vec<bool>) {
-        maybe.clear();
-        maybe.extend(keys.iter().map(|&k| self.bloom.maybe(k)));
-        const AHEAD: usize = 16;
-        for i in 0..keys.len().min(AHEAD) {
-            if maybe[i] {
-                self.map.prefetch(keys[i]);
+    /// Replaces each user_id key in `keys` by its person. First the Bloom
+    /// filter picks the keys that may be renamed, and their map slots are
+    /// prefetched; then those are looked up. `cand` is scratch.
+    fn resolve(&self, keys: &mut [u64], cand: &mut Vec<(u32, u32)>) {
+        cand.clear();
+        for (i, &k) in keys.iter().enumerate() {
+            if self.bloom.maybe(k) {
+                let (b, _, s) = self.map.home(k);
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                    _mm_prefetch(self.map.slots.as_ptr().add(b + s) as *const i8, _MM_HINT_T0);
+                }
+                cand.push((i as u32, (b + s) as u32));
             }
         }
-        for i in 0..keys.len() {
-            if i + AHEAD < keys.len() && maybe[i + AHEAD] {
-                self.map.prefetch(keys[i + AHEAD]);
-            }
-            if maybe[i] {
-                if let Some(name) = self.map.get(keys[i]) {
-                    keys[i] = name;
-                }
+        for &(i, at) in cand.iter() {
+            let k = keys[i as usize];
+            if let Some(name) = self.map.get_from(k, at as usize) {
+                keys[i as usize] = name;
             }
         }
     }
@@ -578,17 +580,31 @@ fn for_lines(chunk: &'static [u8], mut f: impl FnMut(&'static [u8])) {
 }
 
 fn run_par<S: Send>(states: &mut [S], ntasks: usize, f: impl Fn(&mut S, usize) + Sync) {
+    run_par_then(states, ntasks, f, |_, _| {});
+}
+
+/// `run_par`, and then each thread calls `then` with its state and index
+/// once the tasks have run out.
+fn run_par_then<S: Send>(
+    states: &mut [S],
+    ntasks: usize,
+    f: impl Fn(&mut S, usize) + Sync,
+    then: impl Fn(&mut S, usize) + Sync,
+) {
     let next = AtomicUsize::new(0);
     std::thread::scope(|sc| {
-        for st in states.iter_mut() {
+        for (t, st) in states.iter_mut().enumerate() {
             let next = &next;
-            let f = &f;
-            sc.spawn(move || loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= ntasks {
-                    break;
+            let (f, then) = (&f, &then);
+            sc.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= ntasks {
+                        break;
+                    }
+                    f(st, i);
                 }
-                f(st, i);
+                then(st, t);
             });
         }
     });
@@ -753,7 +769,7 @@ struct ParseOut {
     odd: Vec<(u64, &'static [u8])>,
     scratch: Vec<Ck>,
     keys: Vec<u64>,
-    maybe: Vec<bool>,
+    cand: Vec<(u32, u32)>,
 }
 
 struct DedupOut {
@@ -762,7 +778,7 @@ struct DedupOut {
     filled: Vec<u32>,
     keys: Vec<u64>,
     rest: Vec<(u32, u32)>,
-    maybe: Vec<bool>,
+    cand: Vec<(u32, u32)>,
 }
 
 pub struct PersonOut {
@@ -775,19 +791,51 @@ pub struct PersonOut {
     group: Group,
 }
 
+/// An event being grouped: ts, price | category << 24, and its person's
+/// index in the bucket.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Tp {
+    ts: u32,
+    pc: u32,
+    id: u32,
+}
+
+/// Radix digits of ts: three of 11 bits cover the u32 times of the window.
+const DIGIT: usize = 1 << 11;
+
 /// Scratch for grouping one bucket's events and clicks by person: a small
-/// table gives each person a dense index, then a counting sort groups them.
+/// table gives each person a dense index; events are sorted by ts with a
+/// radix sort, then grouped (stably) by a counting sort.
 #[derive(Default)]
 struct Group {
     table: Vec<(u64, u32)>,
     filled: Vec<u32>,
     persons: Vec<u64>,
-    local: Vec<u32>,
     starts: Vec<u32>,
-    evs: Vec<Pe>,
+    hist: Vec<u32>,
+    tmp: Vec<Tp>,
+    evs: Vec<Tp>,
     ck_local: Vec<u32>,
     ck_starts: Vec<u32>,
     cks: Vec<Ck>,
+}
+
+/// Moves `src` to `dst` in the order of `key`, given each key's first
+/// place in `at`; stable.
+#[inline(always)]
+fn radix_pass(src: &[Tp], dst: &mut Vec<Tp>, at: &mut [u32], key: impl Fn(u32) -> usize) {
+    dst.clear();
+    dst.reserve(src.len());
+    let out = dst.as_mut_ptr();
+    for t in src {
+        let k = key(t.ts) & (DIGIT - 1);
+        // SAFETY: the places of all keys are below src.len().
+        unsafe { out.add(at[k] as usize).write(*t) };
+        at[k] += 1;
+    }
+    // SAFETY: every place in 0..len was written once.
+    unsafe { dst.set_len(src.len()) };
 }
 
 impl Group {
@@ -805,8 +853,16 @@ impl Group {
         }
         let table = &mut self.table[..size];
         self.persons.clear();
-        self.local.clear();
         self.filled.clear();
+        // Each event with its person's index; the counts of every ts digit
+        // and of every person come on the way.
+        self.hist.clear();
+        self.hist.resize(3 * DIGIT, 0);
+        self.starts.clear();
+        self.starts.push(0);
+        self.evs.clear();
+        self.evs.reserve(n);
+        let hist = &mut self.hist[..];
         for part in ev_parts {
             for e in *part {
                 let mut i = slot_of(e.person, shift);
@@ -819,22 +875,47 @@ impl Group {
                         let v = self.persons.len() as u32;
                         table[i] = (e.person, v);
                         self.persons.push(e.person);
+                        self.starts.push(0);
                         self.filled.push(i as u32);
                         break v;
                     }
                     i = (i + 1) & mask;
                 };
-                self.local.push(id);
+                self.starts[id as usize + 1] += 1;
+                hist[e.ts as usize & (DIGIT - 1)] += 1;
+                hist[DIGIT + (e.ts as usize >> 11 & (DIGIT - 1))] += 1;
+                hist[2 * DIGIT + (e.ts as usize >> 22)] += 1;
+                self.evs.push(Tp { ts: e.ts, pc: e.pc, id });
             }
         }
         let np = self.persons.len();
-        counting_place(ev_parts, &self.local, np, &mut self.starts, &mut self.evs);
-        for p in 0..np {
-            let (a, b) = (self.starts[p] as usize, self.starts[p + 1] as usize);
-            if b - a > 1 {
-                self.evs[a..b].sort_unstable_by_key(|e| e.ts);
+        for d in hist.chunks_mut(DIGIT) {
+            let mut at = 0;
+            for c in d {
+                (*c, at) = (at, at + *c);
             }
         }
+        let (h0, rest) = hist.split_at_mut(DIGIT);
+        let (h1, h2) = rest.split_at_mut(DIGIT);
+        radix_pass(&self.evs, &mut self.tmp, h0, |ts| ts as usize);
+        radix_pass(&self.tmp, &mut self.evs, h1, |ts| ts as usize >> 11);
+        radix_pass(&self.evs, &mut self.tmp, h2, |ts| ts as usize >> 22);
+        // Then by person, stably: each person's events come out by ts.
+        for p in 0..np {
+            self.starts[p + 1] += self.starts[p];
+        }
+        self.evs.clear();
+        self.evs.reserve(n);
+        let out = self.evs.as_mut_ptr();
+        let mut at: Vec<u32> = self.starts[..np].to_vec();
+        for t in &self.tmp {
+            let c = &mut at[t.id as usize];
+            // SAFETY: person p's places are starts[p]..starts[p + 1] <= n.
+            unsafe { out.add(*c as usize).write(*t) };
+            *c += 1;
+        }
+        // SAFETY: every place in 0..n was written once.
+        unsafe { self.evs.set_len(n) };
 
         self.ck_local.clear();
         for part in ck_parts {
@@ -1044,7 +1125,7 @@ fn main() {
             odd: Vec::new(),
             scratch: Vec::new(),
             keys: Vec::new(),
-            maybe: Vec::new(),
+            cand: Vec::new(),
         })
         .collect();
     let t_parse = Instant::now();
@@ -1084,7 +1165,7 @@ fn main() {
             filled: Vec::new(),
             keys: Vec::new(),
             rest: Vec::new(),
-            maybe: Vec::new(),
+            cand: Vec::new(),
         })
         .collect();
     {
@@ -1144,7 +1225,7 @@ fn main() {
                     out.rest.push((e.ts, e.pc));
                 }
             }
-            links.resolve(&mut out.keys, &mut out.maybe);
+            links.resolve(&mut out.keys, &mut out.cand);
             let mut pending = Pending::new();
             for (&person, &(ts, pc)) in out.keys.iter().zip(&out.rest) {
                 pending.push(&mut out.pe, bucket_of(person, p_shift), Pe { person, ts, pc });
@@ -1175,11 +1256,16 @@ fn main() {
             group: Group::default(),
         })
         .collect();
+    let (user_dir, camp_dir) = output::make_dirs(&out_dir);
     {
         let dedup_outs = &dedup_outs;
         let parse_outs = &parse_outs;
         let odd = &odd;
-        run_par(&mut person_outs, nb_p, |out, b| {
+        let user_dir = &user_dir;
+        // A thread writes its user_daily file as soon as it runs out of
+        // buckets, while the others finish theirs.
+        let then = |out: &mut PersonOut, t: usize| output::write_users(user_dir, t, &out.users);
+        run_par_then(&mut person_outs, nb_p, |out, b| {
             let ev_parts: Vec<&[Pe]> = dedup_outs.iter().flat_map(|d| d.pe.bucket(b)).collect();
             let ck_parts: Vec<&[Ck]> = parse_outs.iter().flat_map(|p| p.ck.bucket(b)).collect();
             let mut g = std::mem::take(&mut out.group);
@@ -1190,14 +1276,14 @@ fn main() {
                 process_person(ctx, g.persons[p], evs, cks, odd, out);
             }
             out.group = g;
-        });
+        }, then);
     }
     eprintln!("persons: {:?}", t_start.elapsed());
     // The arenas are done with; free them in the background while writing.
     std::thread::spawn(move || drop((dedup_outs, parse_outs)));
 
     // ---- write
-    output::write_all(&out_dir, ctx, &mut person_outs);
+    output::write_rest(&user_dir, &camp_dir, ctx, &person_outs);
     eprintln!("done: {:?}", t_start.elapsed());
     // Skip freeing the big allocations.
     std::process::exit(0);
@@ -1260,14 +1346,14 @@ impl csv::Sink for EventSink<'_> {
 }
 
 fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out: &mut ParseOut) {
-    let ParseOut { ck, odd, scratch, keys, maybe, .. } = out;
+    let ParseOut { ck, odd, scratch, keys, cand, .. } = out;
     // First the clicks with their user_id key in `person`; then the person
     // lookups, prefetched a few ahead, since the links table is large.
     scratch.clear();
     csv::for_each_line::<4>(chunk, &mut ClickSink { ctx, scratch, odd });
     keys.clear();
     keys.extend(scratch.iter().map(|c| c.person));
-    links.resolve(keys, maybe);
+    links.resolve(keys, cand);
     let mut pending = Pending::new();
     for (c, &person) in scratch.iter().zip(keys.iter()) {
         pending.push(ck, bucket_of(person, shift), Ck { person, ..*c });
@@ -1307,7 +1393,7 @@ impl csv::Sink for ClickSink<'_> {
     }
 }
 
-fn process_person(ctx: &Ctx, person: u64, evs: &[Pe], cks: &[Ck], odd: &Odd, out: &mut PersonOut) {
+fn process_person(ctx: &Ctx, person: u64, evs: &[Tp], cks: &[Ck], odd: &Odd, out: &mut PersonOut) {
     let nd = ctx.ndays;
     let organic = ctx.organic();
     out.sess.clear();
