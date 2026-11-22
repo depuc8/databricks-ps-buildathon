@@ -22,7 +22,6 @@ use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use memchr::memchr;
@@ -188,9 +187,13 @@ impl Bloom {
         let h = fmix64(k ^ 0x5851_f42d_4c95_7f2d);
         (h as usize & self.mask, 1 << (h >> 40 & 63) | 1 << (h >> 46 & 63) | 1 << (h >> 52 & 63) | 1 << (h >> 58))
     }
-    fn insert(&mut self, k: u64) {
+    /// Inserts k; several threads may insert at once.
+    fn insert_shared(&self, k: u64) {
         let (w, pattern) = self.spot(k);
-        self.bits[w] |= pattern;
+        // SAFETY: w <= mask; the word is only ever accessed atomically while
+        // inserting.
+        let word = unsafe { &*(self.bits.ptr.add(w) as *const std::sync::atomic::AtomicU64) };
+        word.fetch_or(pattern, Ordering::Relaxed);
     }
     #[inline(always)]
     fn maybe(&self, k: u64) -> bool {
@@ -552,12 +555,17 @@ impl PartMap {
             i = (i + 1) & m;
         }
     }
-    fn insert(&mut self, k: u64, v: u64) {
+    /// Inserts k -> v.
+    ///
+    /// # Safety
+    /// Threads inserting at once must insert into different partitions.
+    unsafe fn insert_shared(&self, k: u64, v: u64) {
         let (b, m, mut i) = self.home(k);
-        while self.slots[b + i].0 != 0 && self.slots[b + i].0 != k {
+        let slots = self.slots.ptr;
+        while (*slots.add(b + i)).0 != 0 && (*slots.add(b + i)).0 != k {
             i = (i + 1) & m;
         }
-        self.slots[b + i] = (k, v);
+        slots.add(b + i).write((k, v));
     }
 }
 
@@ -767,77 +775,177 @@ fn slot_of(k: u64, shift: u32) -> usize {
 
 // ---------------------------------------------------------------- links
 
-fn build_links(files: &[PathBuf]) -> Links {
-    let mut pairs: Vec<(u64, u64)> = Vec::new();
-    let mut odd = Vec::new();
+/// A raw pointer that worker threads may share, each writing its own part.
+#[derive(Clone, Copy)]
+struct SharedPtr<T>(*mut T);
+unsafe impl<T> Send for SharedPtr<T> {}
+unsafe impl<T> Sync for SharedPtr<T> {}
+
+impl<T> SharedPtr<T> {
+    /// # Safety
+    /// As for `pointer::add`; no two threads may use the same place.
+    unsafe fn at(&self, i: usize) -> *mut T {
+        self.0.add(i)
+    }
+}
+
+/// The links' IDs parsed and interned, ready for the union-find.
+struct LinkPrep {
+    /// Pairs of each thread; thread t's pair j is pair off[t] + j, whose
+    /// sides are slots 2 i and 2 i + 1.
+    pairs: Vec<Vec<(u64, u64)>>,
+    off: Vec<usize>,
+    odd: Vec<(u64, &'static [u8])>,
+    id_of: Vec<u32>,
+    keys: Vec<u64>,
+    id_start: Vec<u32>,
+    shift: u32,
+}
+
+/// Parses the links and interns their IDs on all threads: a partition at a
+/// time (the partitions of the final map), so each partition's table stays
+/// in cache. Ids come out dense and grouped by partition.
+fn prepare_links(files: &[PathBuf], nthreads: usize) -> LinkPrep {
+    let mut pieces = Vec::new();
     for p in files {
+        chunks(body(leak_read(p)), CLICK_CHUNK, &mut pieces);
+    }
+    let mut outs: Vec<(Vec<(u64, u64)>, Vec<(u64, &'static [u8])>)> = (0..nthreads).map(|_| (Vec::new(), Vec::new())).collect();
+    run_par(&mut outs, pieces.len(), |(pairs, odd), i| {
         let mut add = |l: &csv::Line| {
             let ((a, aw), (b, bw)) = (l.get_w(0), l.get_w(1));
             if !a.is_empty() && !b.is_empty() {
-                pairs.push((ids::key_keep_w(a, aw, &mut odd), ids::key_keep_w(b, bw, &mut odd)));
+                pairs.push((ids::key_keep_w(a, aw, odd), ids::key_keep_w(b, bw, odd)));
             }
         };
         // SAFETY: `leak_read` pads its mappings.
-        unsafe { csv::for_each_line_padded::<2>(body(leak_read(p)), &mut add) };
+        unsafe { csv::for_each_line_padded::<2>(pieces[i], &mut add) };
+    });
+    let mut off = vec![0usize; nthreads + 1];
+    for t in 0..nthreads {
+        off[t + 1] = off[t] + outs[t].0.len();
     }
-    let odd_map: Odd = odd.iter().copied().collect();
-
-    // Intern the IDs a partition at a time (the partitions of the final
-    // map), so each partition's table stays in cache: ids come out dense
-    // and grouped by partition. Slot 2i + side is side `side` of pair i.
-    let nslots = pairs.len() * 2;
+    let nslots = off[nthreads] * 2;
     let pbits = bits_for(nslots, 2048, 1, 12);
     let shift = 64 - pbits;
     let np = 1usize << pbits;
     let part = |k: u64| (PartMap::hash(k) >> shift) as usize;
+
+    // Slots by partition, each thread its own, then each thread scatters
+    // its slots to (partition, thread) places.
+    let mut counts: Vec<Vec<u32>> = vec![vec![0; np]; nthreads];
+    std::thread::scope(|sc| {
+        for (c, o) in counts.iter_mut().zip(&outs) {
+            sc.spawn(move || {
+                for &(a, b) in &o.0 {
+                    c[part(a)] += 1;
+                    c[part(b)] += 1;
+                }
+            });
+        }
+    });
     let mut start = vec![0u32; np + 1];
-    for &(a, b) in &pairs {
-        start[part(a) + 1] += 1;
-        start[part(b) + 1] += 1;
-    }
+    let mut at = 0u32;
     for p in 0..np {
-        start[p + 1] += start[p];
-    }
-    let mut cursor = start.clone();
-    let mut items: Vec<(u64, u32)> = vec![(0, 0); nslots];
-    for (i, &(a, b)) in pairs.iter().enumerate() {
-        for (side, k) in [(0, a), (1, b)] {
-            let c = &mut cursor[part(k)];
-            items[*c as usize] = (k, (2 * i + side) as u32);
-            *c += 1;
+        start[p] = at;
+        for c in counts.iter_mut() {
+            (c[p], at) = (at, at + c[p]);
         }
     }
-    let mut id_of = vec![0u32; nslots];
-    let mut keys: Vec<u64> = Vec::with_capacity(nslots / 2 + 16);
-    let mut id_start = vec![0u32; np + 1];
-    let mut scratch: Vec<(u64, u32)> = Vec::new();
-    for p in 0..np {
+    start[np] = at;
+    let mut items: Vec<(u64, u32)> = Vec::with_capacity(nslots);
+    let items_out = SharedPtr(items.as_mut_ptr());
+    std::thread::scope(|sc| {
+        for (t, (c, o)) in counts.iter_mut().zip(&outs).enumerate() {
+            let base = off[t];
+            sc.spawn(move || {
+                let out = items_out;
+                for (j, &(a, b)) in o.0.iter().enumerate() {
+                    for (side, k) in [(0, a), (1, b)] {
+                        let c = &mut c[part(k)];
+                        // SAFETY: each place is written once, below nslots.
+                        unsafe { out.at(*c as usize).write((k, (2 * (base + j) + side) as u32)) };
+                        *c += 1;
+                    }
+                }
+            });
+        }
+    });
+    // SAFETY: all nslots places were written.
+    unsafe { items.set_len(nslots) };
+
+    // Intern each partition: local ids, then global ones.
+    let mut local: Vec<u32> = Vec::with_capacity(nslots);
+    let mut pkeys: Vec<Vec<u64>> = vec![Vec::new(); np];
+    let local_out = SharedPtr(local.as_mut_ptr());
+    let pkeys_out = SharedPtr(pkeys.as_mut_ptr());
+    let mut scratch: Vec<Vec<(u64, u32)>> = vec![Vec::new(); nthreads];
+    run_par(&mut scratch, np, |table, p| {
         let its = &items[start[p] as usize..start[p + 1] as usize];
         let size = (its.len() * 2).next_power_of_two().max(16);
-        scratch.clear();
-        scratch.resize(size, (0, 0));
+        table.clear();
+        table.resize(size, (0, 0));
         let m = size - 1;
-        id_start[p] = keys.len() as u32;
-        for &(k, slot) in its {
+        let mut ks = Vec::new();
+        for (j, &(k, _)) in its.iter().enumerate() {
             let mut i = PartMap::hash(k) as usize & m;
             let id = loop {
-                let (sk, sv) = scratch[i];
+                let (sk, sv) = table[i];
                 if sk == k {
                     break sv;
                 }
                 if sk == 0 {
-                    let id = keys.len() as u32;
-                    scratch[i] = (k, id);
-                    keys.push(k);
+                    let id = ks.len() as u32;
+                    table[i] = (k, id);
+                    ks.push(k);
                     break id;
                 }
                 i = (i + 1) & m;
             };
-            id_of[slot as usize] = id;
+            // SAFETY: partition p's places are its own.
+            unsafe { local_out.at(start[p] as usize + j).write(id) };
         }
+        // SAFETY: only this task writes pkeys[p].
+        unsafe { *pkeys_out.at(p) = ks };
+    });
+    // SAFETY: all nslots places were written.
+    unsafe { local.set_len(nslots) };
+    let mut id_start = vec![0u32; np + 1];
+    for p in 0..np {
+        id_start[p + 1] = id_start[p] + pkeys[p].len() as u32;
     }
-    id_start[np] = keys.len() as u32;
-    drop(items);
+    let n = id_start[np] as usize;
+    let mut keys: Vec<u64> = Vec::with_capacity(n);
+    let mut id_of: Vec<u32> = Vec::with_capacity(nslots);
+    let (keys_out, id_out) = (SharedPtr(keys.as_mut_ptr()), SharedPtr(id_of.as_mut_ptr()));
+    let mut unit = vec![(); nthreads];
+    run_par(&mut unit, np, |_, p| {
+        let base = id_start[p] as usize;
+        for (j, &k) in pkeys[p].iter().enumerate() {
+            // SAFETY: partition p's ids are its own.
+            unsafe { keys_out.at(base + j).write(k) };
+        }
+        for i in start[p] as usize..start[p + 1] as usize {
+            // SAFETY: every slot is in exactly one partition.
+            unsafe { id_out.at(items[i].1 as usize).write(base as u32 + local[i]) };
+        }
+    });
+    // SAFETY: all places were written.
+    unsafe {
+        keys.set_len(n);
+        id_of.set_len(nslots);
+    }
+    let odd = outs.iter_mut().flat_map(|o| o.1.drain(..)).collect();
+    let pairs = outs.into_iter().map(|o| o.0).collect();
+    LinkPrep { pairs, off, odd, id_of, keys, id_start, shift }
+}
+
+/// The rest of the links: union-find and names, then the map, a partition
+/// per task on `nthreads` threads.
+fn build_links(prep: LinkPrep, nthreads: usize) -> Links {
+    let LinkPrep { pairs, off, odd, id_of, keys, id_start, shift } = prep;
+    let np = id_start.len() - 1;
+    let odd_map: Odd = odd.iter().copied().collect();
 
     // Union-find; the root of a set is its smallest id.
     let n = keys.len();
@@ -850,10 +958,12 @@ fn build_links(files: &[PathBuf]) -> Links {
         }
         x
     }
-    for i in 0..pairs.len() {
-        let (ra, rb) = (find(&mut parent, id_of[2 * i]), find(&mut parent, id_of[2 * i + 1]));
-        if ra != rb {
-            parent[ra.max(rb) as usize] = ra.min(rb);
+    for (t, ps) in pairs.iter().enumerate() {
+        for i in off[t]..off[t] + ps.len() {
+            let (ra, rb) = (find(&mut parent, id_of[2 * i]), find(&mut parent, id_of[2 * i + 1]));
+            if ra != rb {
+                parent[ra.max(rb) as usize] = ra.min(rb);
+            }
         }
     }
     drop(id_of);
@@ -881,16 +991,19 @@ fn build_links(files: &[PathBuf]) -> Links {
         mask[p] = size as u32 - 1;
         base[p + 1] = base[p] + size as u32;
     }
-    let mut map = PartMap { slots: Zeroed::new(base[np] as usize), base, mask, shift };
-    let mut bloom = Bloom::new(renamed);
-    for p in 0..np {
+    let map = PartMap { slots: Zeroed::new(base[np] as usize), base, mask, shift };
+    let bloom = Bloom::new(renamed);
+    let mut unit = vec![(); nthreads];
+    run_par(&mut unit, np, |_, p| {
         for i in id_start[p] as usize..id_start[p + 1] as usize {
             if names[i] != keys[i] {
-                map.insert(keys[i], names[i]);
-                bloom.insert(keys[i]);
+                // SAFETY: the ids of partition p are keys of partition p,
+                // and only this task inserts into it.
+                unsafe { map.insert_shared(keys[i], names[i]) };
+                bloom.insert_shared(keys[i]);
             }
         }
-    }
+    });
     Links { map, bloom, odd }
 }
 
@@ -1264,7 +1377,6 @@ fn main() {
     let per_ev = est_ev * 108 / (100 * nthreads - 60).max(100) / nb_ev + 16;
     let per_ck = est_ck * 23 / 20 / nb_p / nthreads + 16;
 
-    let links: OnceLock<Links> = OnceLock::new();
     let mut parse_outs: Vec<ParseOut> = (0..nthreads)
         .map(|_| ParseOut {
             ev: Arena::new(nb_ev, per_ev),
@@ -1277,9 +1389,15 @@ fn main() {
         .collect();
     let t_parse = Instant::now();
     eprintln!("setup: {:?}", t_start.elapsed());
+    // The links' parallel part first, on all threads; the rest (mostly
+    // sequential) runs on one thread beside the event parse. Built wholly
+    // beside it, the links slow the parse more than they cost.
+    let prep = std::sync::Mutex::new(Some(prepare_links(&link_files, nthreads)));
+    eprintln!("links prepared: {:?}", t_parse.elapsed());
+    let links: std::sync::OnceLock<Links> = std::sync::OnceLock::new();
     run_par(&mut parse_outs, 1 + n_ev_chunks + ck_chunks.len(), |out, i| {
         if i == 0 {
-            let l = build_links(&link_files);
+            let l = build_links(prep.lock().unwrap().take().expect("links"), 1);
             eprintln!("links built: {:?}", t_parse.elapsed());
             let _ = links.set(l);
         } else if i <= n_ev_chunks {
@@ -1288,9 +1406,10 @@ fn main() {
             release(ev_chunks[i - 1]);
         } else {
             let links = links.wait();
-            populate(ck_chunks[i - 1 - n_ev_chunks]);
-            parse_clicks(ck_chunks[i - 1 - n_ev_chunks], ctx, links, p_shift, out);
-            release(ck_chunks[i - 1 - n_ev_chunks]);
+            let c = ck_chunks[i - 1 - n_ev_chunks];
+            populate(c);
+            parse_clicks(c, ctx, links, p_shift, out);
+            release(c);
         }
     });
     let links = links.into_inner().expect("links");
