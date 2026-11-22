@@ -195,13 +195,6 @@ impl Bloom {
         let word = unsafe { &*(self.bits.ptr.add(w) as *const std::sync::atomic::AtomicU64) };
         word.fetch_or(pattern, Ordering::Relaxed);
     }
-    #[inline(always)]
-    fn maybe(&self, k: u64) -> bool {
-        let (w, pattern) = self.spot(k);
-        // SAFETY: w <= mask < bits.len().
-        let word = unsafe { *self.bits.get_unchecked(w) };
-        word & pattern == pattern
-    }
 }
 
 // ---------------------------------------------------------------- arenas
@@ -581,10 +574,32 @@ impl Links {
     /// Replaces each user_id key in `keys` by its person. First the Bloom
     /// filter picks the keys that may be renamed, and their map slots are
     /// prefetched; then those are looked up. `cand` is scratch.
-    fn resolve(&self, keys: &mut [u64], cand: &mut Vec<(u32, u32)>) {
+    fn resolve(&self, keys: &mut [u64], cand: &mut Vec<(u32, u32)>, spots: &mut Vec<(u32, u64)>) {
+        // The Bloom words of all keys first, each prefetched a few keys
+        // ahead of its test, with no branch on the outcome in that loop.
+        const AHEAD: usize = 16;
+        spots.clear();
+        spots.extend(keys.iter().map(|&k| {
+            let (w, pattern) = self.bloom.spot(k);
+            (w as u32, pattern)
+        }));
+        let bits = self.bloom.bits.ptr;
+        for i in 0..spots.len() {
+            if let Some(&(w, _)) = spots.get(i + AHEAD) {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                    _mm_prefetch(bits.add(w as usize) as *const i8, _MM_HINT_T0);
+                }
+            }
+            let (w, pattern) = spots[i];
+            // SAFETY: w <= mask < bits.len().
+            let word = unsafe { *bits.add(w as usize) };
+            spots[i].1 = (word & pattern == pattern) as u64;
+        }
         cand.clear();
         for (i, &k) in keys.iter().enumerate() {
-            if self.bloom.maybe(k) {
+            if spots[i].1 != 0 {
                 let (b, _, s) = self.map.home(k);
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
@@ -1031,6 +1046,7 @@ struct ParseOut {
     scratch: Vec<Ck>,
     keys: Vec<u64>,
     cand: Vec<(u32, u32)>,
+    spots: Vec<(u32, u64)>,
 }
 
 struct DedupOut {
@@ -1040,6 +1056,7 @@ struct DedupOut {
     keys: Vec<u64>,
     rest: Vec<(u32, u32)>,
     cand: Vec<(u32, u32)>,
+    spots: Vec<(u32, u64)>,
 }
 
 pub struct PersonOut {
@@ -1400,6 +1417,7 @@ fn main() {
             scratch: Vec::new(),
             keys: Vec::new(),
             cand: Vec::new(),
+            spots: Vec::new(),
         })
         .collect();
     let t_parse = Instant::now();
@@ -1457,6 +1475,7 @@ fn main() {
             keys: Vec::new(),
             rest: Vec::new(),
             cand: Vec::new(),
+            spots: Vec::new(),
         })
         .collect();
     {
@@ -1516,7 +1535,7 @@ fn main() {
                     out.rest.push((e.ts, e.pc));
                 }
             }
-            links.resolve(&mut out.keys, &mut out.cand);
+            links.resolve(&mut out.keys, &mut out.cand, &mut out.spots);
             // The bucket's copies are all read: their memory takes the
             // survivors, now by person bucket, instead of fresh pages.
             for po in parse_outs {
@@ -1659,7 +1678,7 @@ fn event_type(t: &[u8]) -> u8 {
 }
 
 fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out: &mut ParseOut) {
-    let ParseOut { ck, odd, scratch, keys, cand, .. } = out;
+    let ParseOut { ck, odd, scratch, keys, cand, spots, .. } = out;
     // First the clicks with their user_id key in `person`; then the person
     // lookups, prefetched a few ahead, since the links table is large.
     scratch.clear();
@@ -1667,7 +1686,7 @@ fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out:
     unsafe { csv::for_each_line_padded::<4>(chunk, &mut ClickSink { ctx, scratch, odd }) };
     keys.clear();
     keys.extend(scratch.iter().map(|c| c.person));
-    links.resolve(keys, cand);
+    links.resolve(keys, cand, spots);
     let mut pending = Pending::new();
     for (c, &person) in scratch.iter().zip(keys.iter()) {
         pending.push(ck, bucket_of(person, shift), Ck { person, ..*c });
