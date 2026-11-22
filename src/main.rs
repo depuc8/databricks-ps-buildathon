@@ -1281,41 +1281,8 @@ struct Session {
     purchase: bool,
 }
 
-fn main() {
-    let t_start = Instant::now();
-    ids::init();
-    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
-    let out_dir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
-    let nthreads: usize = std::env::var("NCPU")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
-        .clamp(1, 32);
-
-    // The input files are listed, mapped and cut into chunks meanwhile.
-    let files = {
-        let data = data.clone();
-        std::thread::spawn(move || {
-            let link_files = csv_files(&data.join("links"));
-            let mut ev_chunks = Vec::new();
-            let mut ev_bytes = 0usize;
-            for p in csv_files(&data.join("events")) {
-                let b = body(leak_read(&p));
-                ev_bytes += b.len();
-                chunks(b, CHUNK, &mut ev_chunks);
-            }
-            let mut ck_chunks = Vec::new();
-            let mut ck_bytes = 0usize;
-            for p in csv_files(&data.join("clicks")) {
-                let b = body(leak_read(&p));
-                ck_bytes += b.len();
-                chunks(b, CLICK_CHUNK, &mut ck_chunks);
-            }
-            (link_files, ev_chunks, ev_bytes, ck_chunks, ck_bytes)
-        })
-    };
-
-    // ---- small inputs
+/// The window, products and campaigns.
+fn small_inputs(data: &Path) -> Ctx {
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
@@ -1388,10 +1355,64 @@ fn main() {
         campaign_ids,
         channels,
     };
+    ctx
+}
+
+fn main() {
+    let t_start = Instant::now();
+    ids::init();
+    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
+    let out_dir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
+    let nthreads: usize = std::env::var("NCPU")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+        .clamp(1, 32);
+
+    // The input files are listed, mapped and cut into chunks meanwhile, and
+    // the small inputs read.
+    let files = {
+        let data = data.clone();
+        std::thread::spawn(move || {
+            let mut ev_chunks = Vec::new();
+            let mut ev_bytes = 0usize;
+            for p in csv_files(&data.join("events")) {
+                let b = body(leak_read(&p));
+                ev_bytes += b.len();
+                chunks(b, CHUNK, &mut ev_chunks);
+            }
+            let mut ck_chunks = Vec::new();
+            let mut ck_bytes = 0usize;
+            for p in csv_files(&data.join("clicks")) {
+                let b = body(leak_read(&p));
+                ck_bytes += b.len();
+                chunks(b, CLICK_CHUNK, &mut ck_chunks);
+            }
+            (ev_chunks, ev_bytes, ck_chunks, ck_bytes)
+        })
+    };
+    let small = {
+        let data = data.clone();
+        std::thread::spawn(move || small_inputs(&data))
+    };
+    let link_files = csv_files(&data.join("links"));
+    // Mapping files locks the address space against page faults: done
+    // before the links' parallel part, which faults in much new memory.
+    let (ev_chunks, ev_bytes, ck_chunks, ck_bytes) = files.join().expect("file listing");
+    let t_parse = Instant::now();
+    eprintln!("setup: {:?}", t_start.elapsed());
+    // The links' parallel part first, on all threads; the sequential part
+    // runs on one thread beside the event parse; the map is filled by
+    // FILLS tasks after the events, before the clicks. Built wholly beside
+    // the parse, the links slow it more than they cost.
+    let prep = std::sync::Mutex::new(Some(prepare_links(&link_files, nthreads)));
+    eprintln!("links prepared: {:?}", t_parse.elapsed());
+    let ctx = small.join().expect("small inputs");
     let ctx = &ctx;
+    let ndays = ctx.ndays;
+
 
     // ---- parse: links on one thread, events and then clicks on all
-    let (link_files, ev_chunks, ev_bytes, ck_chunks, ck_bytes) = files.join().expect("file listing");
     let n_ev_chunks = ev_chunks.len();
 
     // Event lines average about 77 bytes and click lines about 47.
@@ -1423,14 +1444,7 @@ fn main() {
             spots: Vec::new(),
         })
         .collect();
-    let t_parse = Instant::now();
-    eprintln!("setup: {:?}", t_start.elapsed());
-    // The links' parallel part first, on all threads; the sequential part
-    // runs on one thread beside the event parse; the map is filled by
-    // FILLS tasks after the events, before the clicks. Built wholly beside
-    // the parse, the links slow it more than they cost.
-    let prep = std::sync::Mutex::new(Some(prepare_links(&link_files, nthreads)));
-    eprintln!("links prepared: {:?}", t_parse.elapsed());
+    eprintln!("arenas: {:?}", t_start.elapsed());
     let tail: std::sync::OnceLock<LinkTail> = std::sync::OnceLock::new();
     const FILLS: usize = 16;
     let filled = AtomicUsize::new(0);

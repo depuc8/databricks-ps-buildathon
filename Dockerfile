@@ -1,11 +1,13 @@
 # Shopping Sessions: a native Rust pipeline (see src/main.rs).
-# The scorers are linux/amd64 Intel Xeon (Cascade Lake or newer), so AVX2 is
-# safe to target.
-FROM rust:1.90-slim-bookworm AS build
+# x86-64-v3 (AVX2, BMI2) is safe on the scorers. The build is guided by a
+# profile (pgo/merged.profdata, made with this rustc from runs on 20M- and
+# 1M-event datasets): the profile must come from the same rustc version.
+FROM rust:1.100.0-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"
+COPY pgo ./pgo
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq -C profile-use=/src/pgo/merged.profdata"
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
