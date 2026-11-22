@@ -567,7 +567,8 @@ struct Links {
     map: PartMap,
     /// The keys of `map`: most IDs are not renamed and skip the table.
     bloom: Bloom,
-    odd: Vec<(u64, &'static [u8])>,
+    /// The bytes of the odd linked IDs.
+    odd: Odd,
 }
 
 impl Links {
@@ -961,7 +962,7 @@ fn prepare_links(files: &[PathBuf], nthreads: usize) -> LinkPrep {
 fn build_links(prep: LinkPrep) -> LinkTail {
     let LinkPrep { pairs, off, odd, id_of, keys, id_start, shift } = prep;
     let np = id_start.len() - 1;
-    let odd_map: Odd = odd.iter().copied().collect();
+    let odd: Odd = odd.into_iter().collect();
 
     // Union-find; the root of a set is its smallest id.
     let n = keys.len();
@@ -986,7 +987,7 @@ fn build_links(prep: LinkPrep) -> LinkTail {
     let mut best: Vec<u64> = keys.clone();
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
-        if ids::cmp(keys[i], best[r], &odd_map).is_lt() {
+        if ids::cmp(keys[i], best[r], &odd).is_lt() {
             best[r] = keys[i];
         }
     }
@@ -1042,7 +1043,10 @@ impl LinkTail {
 struct ParseOut {
     ev: Arena<Ev>,
     ck: Arena<Ck>,
+    /// The odd user IDs of valid event copies, one entry a copy; once the
+    /// thread's parsing is done, grouped by person bucket (see `odd_at`).
     odd: Vec<(u64, &'static [u8])>,
+    odd_at: Vec<u32>,
     scratch: Vec<Ck>,
     keys: Vec<u64>,
     cand: Vec<(u32, u32)>,
@@ -1414,6 +1418,7 @@ fn main() {
             ev: Arena::new(nb_ev, per_ev),
             ck: Arena::new(nb_p, per_ck),
             odd: Vec::new(),
+            odd_at: Vec::new(),
             scratch: Vec::new(),
             keys: Vec::new(),
             cand: Vec::new(),
@@ -1431,7 +1436,26 @@ fn main() {
     let tail: std::sync::OnceLock<LinkTail> = std::sync::OnceLock::new();
     const FILLS: usize = 16;
     let filled = AtomicUsize::new(0);
-    run_par(&mut parse_outs, 1 + n_ev_chunks + FILLS + ck_chunks.len(), |out, i| {
+    // A thread out of tasks groups its odd user IDs by person bucket.
+    let group_odd = |out: &mut ParseOut, _: usize| {
+        let mut at = vec![0u32; nb_p + 1];
+        for &(k, _) in &out.odd {
+            at[bucket_of(k, p_shift) + 1] += 1;
+        }
+        for b in 0..nb_p {
+            at[b + 1] += at[b];
+        }
+        let mut sorted = vec![(0u64, &[][..]); out.odd.len()];
+        let mut next = at.clone();
+        for &(k, v) in &out.odd {
+            let b = bucket_of(k, p_shift);
+            sorted[next[b] as usize] = (k, v);
+            next[b] += 1;
+        }
+        out.odd = sorted;
+        out.odd_at = at;
+    };
+    run_par_then(&mut parse_outs, 1 + n_ev_chunks + FILLS + ck_chunks.len(), |out, i| {
         if i == 0 {
             let _ = tail.set(build_links(prep.lock().unwrap().take().expect("links")));
             eprintln!("links built: {:?}", t_parse.elapsed());
@@ -1452,12 +1476,8 @@ fn main() {
             parse_clicks(c, ctx, &tail.wait().links, p_shift, out);
             release(c);
         }
-    });
+    }, group_odd);
     let links = tail.into_inner().expect("links").links;
-    let mut odd: Odd = links.odd.iter().copied().collect();
-    for o in &mut parse_outs {
-        odd.extend(o.odd.drain(..));
-    }
     let n_ev: usize = parse_outs.iter().map(|o| o.ev.total()).sum();
     eprintln!("parse: {:?} ({n_ev} event lines, {} buckets)", t_start.elapsed(), nb_ev);
 
@@ -1574,7 +1594,7 @@ fn main() {
     {
         let dedup_outs = &dedup_outs;
         let parse_outs = &parse_outs;
-        let odd = &odd;
+        let links = &links;
         let user_dir = &user_dir;
         // A thread writes its user_daily file as soon as it runs out of
         // buckets, while the others finish theirs.
@@ -1587,7 +1607,9 @@ fn main() {
             for p in 0..g.persons.len() {
                 let evs = &g.evs[g.starts[p] as usize..g.starts[p + 1] as usize];
                 let cks = &g.cks[g.ck_starts[p] as usize..g.ck_starts[p + 1] as usize];
-                process_person(ctx, g.persons[p], evs, cks, odd, out);
+                let person = g.persons[p];
+                let name = if person & ids::ODD == 0 { &[][..] } else { odd_name(person, b, parse_outs, links) };
+                process_person(ctx, person, name, evs, cks, out);
             }
             out.group = g;
         }, then);
@@ -1678,12 +1700,12 @@ fn event_type(t: &[u8]) -> u8 {
 }
 
 fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out: &mut ParseOut) {
-    let ParseOut { ck, odd, scratch, keys, cand, spots, .. } = out;
+    let ParseOut { ck, scratch, keys, cand, spots, .. } = out;
     // First the clicks with their user_id key in `person`; then the person
     // lookups, prefetched a few ahead, since the links table is large.
     scratch.clear();
     // SAFETY: chunks come from `leak_read`, padded.
-    unsafe { csv::for_each_line_padded::<4>(chunk, &mut ClickSink { ctx, scratch, odd }) };
+    unsafe { csv::for_each_line_padded::<4>(chunk, &mut ClickSink { ctx, scratch }) };
     keys.clear();
     keys.extend(scratch.iter().map(|c| c.person));
     links.resolve(keys, cand, spots);
@@ -1697,7 +1719,6 @@ fn parse_clicks(chunk: &'static [u8], ctx: &Ctx, links: &Links, shift: u32, out:
 struct ClickSink<'a> {
     ctx: &'a Ctx,
     scratch: &'a mut Vec<Ck>,
-    odd: &'a mut Vec<(u64, &'static [u8])>,
 }
 
 impl csv::Sink for ClickSink<'_> {
@@ -1722,11 +1743,25 @@ impl csv::Sink for ClickSink<'_> {
             None => return,
         };
         let person = ids::key_w(user, user_w);
-        self.scratch.push(Ck { person, id: ids::key_keep_w(id, id_w, self.odd), ts: (t - ctx.t0) as u32, camp });
+        self.scratch.push(Ck { person, id: ids::order_key_w(id, id_w), ts: (t - ctx.t0) as u32, camp });
     }
 }
 
-fn process_person(ctx: &Ctx, person: u64, evs: &[Tp], cks: &[Ck], odd: &Odd, out: &mut PersonOut) {
+/// The bytes of an odd person name in person bucket b: an event's user ID
+/// or a linked ID.
+fn odd_name(person: u64, b: usize, parse_outs: &[ParseOut], links: &Links) -> &'static [u8] {
+    for po in parse_outs {
+        for &(k, v) in &po.odd[po.odd_at[b] as usize..po.odd_at[b + 1] as usize] {
+            if k == person {
+                return v;
+            }
+        }
+    }
+    links.odd[&person]
+}
+
+/// `name` holds the person's bytes if the key is odd.
+fn process_person(ctx: &Ctx, person: u64, name: &[u8], evs: &[Tp], cks: &[Ck], out: &mut PersonOut) {
     let nd = ctx.ndays;
     let organic = ctx.organic();
     out.sess.clear();
@@ -1746,7 +1781,7 @@ fn process_person(ctx: &Ctx, person: u64, evs: &[Tp], cks: &[Ck], odd: &Odd, out
                 *s = 0;
             }
         }
-        users.push(row.person, row.day, row.sessions, row.events, row.revenue, top, odd);
+        users.push(row.person, name, row.day, row.sessions, row.events, row.revenue, top);
     };
 
     for e in evs {
@@ -1787,7 +1822,7 @@ fn process_person(ctx: &Ctx, person: u64, evs: &[Tp], cks: &[Ck], odd: &Odd, out
             let (mut best, mut k) = (j - 1, j - 1);
             while k > 0 && cks[k - 1].ts == t {
                 k -= 1;
-                if ids::cmp(cks[k].id, cks[best].id, odd).is_lt() {
+                if ids::order_cmp(cks[k].id, cks[best].id).is_lt() {
                     best = k;
                 }
             }

@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{IoSlice, Write};
 use std::path::{Path, PathBuf};
 
-use crate::ids::{self, Odd};
+use crate::ids;
 use crate::{CampStat, Ctx, PersonOut};
 
 /// Rows per data page.
@@ -285,12 +285,11 @@ unsafe fn put_bytes(p: *mut u8, v: &[u8]) -> usize {
     4 + v.len()
 }
 
-/// Writes an ID as a BYTE_ARRAY value at p: at most 17 bytes, or 4 plus
-/// the length of an odd ID.
+/// Writes a packed ID as a BYTE_ARRAY value at p: at most 17 bytes.
 #[inline(always)]
-unsafe fn put_id(p: *mut u8, k: u64, odd: &Odd) -> usize {
+unsafe fn put_id(p: *mut u8, k: u64) -> usize {
     #[cfg(target_feature = "bmi2")]
-    if k & ids::ODD == 0 {
+    {
         // The inverse of the packing: bytes 0..8 from bits 7..63, byte 8
         // from bits 0..7. The bytes after the ID are zero.
         let w = std::arch::x86_64::_pdep_u64(k >> 7, 0x7f7f_7f7f_7f7f_7f7f).swap_bytes();
@@ -301,8 +300,11 @@ unsafe fn put_id(p: *mut u8, k: u64, odd: &Odd) -> usize {
         *p.add(12) = (k & 0x7f) as u8;
         return 4 + n;
     }
-    let mut buf = [0u8; 10];
-    put_bytes(p, ids::bytes(k, &mut buf, odd))
+    #[allow(unreachable_code)]
+    {
+        let mut buf = [0u8; 10];
+        put_bytes(p, ids::unpack(k, &mut buf))
+    }
 }
 
 /// One thread's user_daily rows as each column's PLAIN values, appended as
@@ -330,7 +332,8 @@ impl UserCols {
 
     #[inline]
     #[allow(clippy::too_many_arguments)]
-    pub fn push(&mut self, person: u64, day: i32, sessions: i64, events: i64, revenue: i64, top: Option<&[u8]>, odd: &Odd) {
+    /// `name` holds the person's bytes if the key is odd.
+    pub fn push(&mut self, person: u64, name: &[u8], day: i32, sessions: i64, events: i64, revenue: i64, top: Option<&[u8]>) {
         if self.rows % PAGE_ROWS == 0 {
             self.id_pages.push(self.id.len());
             self.top_pages.push(self.top.len());
@@ -342,13 +345,12 @@ impl UserCols {
             self.id.reserve(16);
             // SAFETY: put_id writes 13 bytes for a packed ID.
             unsafe {
-                let n = put_id(self.id.as_mut_ptr().add(self.id.len()), person, odd);
+                let n = put_id(self.id.as_mut_ptr().add(self.id.len()), person);
                 self.id.set_len(self.id.len() + n);
             }
         } else {
-            let v = odd[&person];
-            self.id.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            self.id.extend_from_slice(v);
+            self.id.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            self.id.extend_from_slice(name);
         }
         self.day.push(day);
         self.sessions.push(sessions as i32);
@@ -537,7 +539,6 @@ mod tests {
 
     #[test]
     fn put_id_matches_bytes() {
-        let odd = Odd::default();
         let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
         for _ in 0..100_000 {
             seed ^= seed << 13;
@@ -547,7 +548,7 @@ mod tests {
             let id: Vec<u8> = (0..n).map(|i| 1 + (seed.rotate_left(7 * i as u32) % 127) as u8).collect();
             let k = ids::key(&id);
             let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
-            let na = unsafe { put_id(a.as_mut_ptr(), k, &odd) };
+            let na = unsafe { put_id(a.as_mut_ptr(), k) };
             let nb = unsafe { put_bytes(b.as_mut_ptr(), &id) };
             assert_eq!(&a[..na], &b[..nb], "{id:?}");
         }

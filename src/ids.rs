@@ -66,17 +66,38 @@ unsafe fn pack_wide(s: &[u8]) -> Option<u64> {
     pack(s)
 }
 
+/// The high and low halves of a full product, folded.
+#[inline(always)]
+fn fold(a: u64, b: u64) -> u64 {
+    let p = a as u128 * b as u128;
+    (p as u64) ^ (p >> 64) as u64
+}
+
+/// The 63-bit hash of an odd ID: 16-byte blocks (the last one may overlap
+/// the one before), each folded into the state with one product. The
+/// constants have every byte at least 0x80, so no ASCII word cancels one.
 fn hash_odd(s: &[u8]) -> u64 {
-    let mut a: u64 = 0x243f_6a88_85a3_08d3 ^ s.len() as u64;
-    let mut b: u64 = 0x1319_8a2e_0370_7344;
-    for c in s.chunks(8) {
-        let mut w = [0u8; 8];
-        w[..c.len()].copy_from_slice(c);
-        let x = u64::from_le_bytes(w);
-        a = crate::fmix64(a ^ x).wrapping_add(b.rotate_left(17));
-        b = crate::fmix64(b.wrapping_add(x) ^ 0x9e37_79b9_7f4a_7c15).wrapping_add(a);
+    const K1: u64 = 0xa076_1d64_78bd_a42f;
+    const K2: u64 = 0xe703_7ed1_a0b4_28db;
+    const K3: u64 = 0x8ebc_6af0_9c88_c6e3;
+    let n = s.len();
+    let w = |i: usize| u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+    let mut h = K3 ^ n as u64;
+    if n >= 16 {
+        let mut i = 0;
+        while i + 16 < n {
+            h = fold(w(i) ^ K1, w(i + 8) ^ K2 ^ h);
+            i += 16;
+        }
+        h = fold(w(n - 16) ^ K1, w(n - 8) ^ K2 ^ h);
+    } else if n >= 8 {
+        h = fold(w(0) ^ K1, w(n - 8) ^ K2 ^ h);
+    } else {
+        let mut b = [0u8; 8];
+        b[..n].copy_from_slice(s);
+        h = fold(u64::from_le_bytes(b) ^ K1, K2 ^ h);
     }
-    ODD | ((a ^ b.rotate_left(29)) >> 1)
+    ODD | (fold(h ^ K2, (n as u64) ^ K1) >> 1)
 }
 
 /// `key`, given whether 16 bytes from `s.as_ptr()` are readable.
@@ -102,6 +123,63 @@ pub fn key_keep_w(s: &'static [u8], wide: bool, odd: &mut Vec<(u64, &'static [u8
     }
 }
 
+/// An order key for a click ID, which is only ever compared, never
+/// matched: packed if it packs, else ODD, its length (all ones if it does
+/// not fit in 16 bits) and the address of its bytes. The bytes end before
+/// the next `,` or `"`, since no value holds one.
+#[inline(always)]
+pub fn order_key_w(s: &'static [u8], wide: bool) -> u64 {
+    match if wide { unsafe { pack_wide(s) } } else { pack(s) } {
+        Some(v) => v,
+        None => {
+            let p = s.as_ptr() as u64;
+            debug_assert!(p < 1 << 47);
+            ODD | (s.len().min(0xffff) as u64) << 47 | p
+        }
+    }
+}
+
+/// The bytes behind an odd `order_key_w`.
+fn order_bytes(k: u64) -> &'static [u8] {
+    let p = (k & ((1 << 47) - 1)) as *const u8;
+    let mut n = (k >> 47 & 0xffff) as usize;
+    // SAFETY: p points into a live input mapping, at a value ended by a
+    // separator; its length is n unless that was too large to keep.
+    unsafe {
+        if n == 0xffff {
+            while *p.add(n) != b',' && *p.add(n) != b'"' {
+                n += 1;
+            }
+        }
+        std::slice::from_raw_parts(p, n)
+    }
+}
+
+/// Byte-wise order of the IDs behind two `order_key_w` keys.
+pub fn order_cmp(a: u64, b: u64) -> std::cmp::Ordering {
+    if (a | b) & ODD == 0 {
+        return a.cmp(&b);
+    }
+    let (mut ba, mut bb) = ([0u8; 10], [0u8; 10]);
+    let sa = if a & ODD != 0 { order_bytes(a) } else { unpack(a, &mut ba) };
+    let sb = if b & ODD != 0 { order_bytes(b) } else { unpack(b, &mut bb) };
+    sa.cmp(sb)
+}
+
+/// The bytes of a packed key.
+pub fn unpack(k: u64, buf: &mut [u8; 10]) -> &[u8] {
+    let mut n = 0;
+    while n < 9 {
+        let c = (k >> (56 - 7 * n)) & 0x7f;
+        if c == 0 {
+            break;
+        }
+        buf[n] = c as u8;
+        n += 1;
+    }
+    &buf[..n]
+}
+
 /// The key of a non-empty ID whose bytes are never needed again.
 #[inline]
 pub fn key(s: &[u8]) -> u64 {
@@ -115,16 +193,7 @@ pub fn bytes<'a>(k: u64, buf: &'a mut [u8; 10], odd: &Odd) -> &'a [u8] {
     if k & ODD != 0 {
         return odd[&k];
     }
-    let mut n = 0;
-    while n < 9 {
-        let c = (k >> (56 - 7 * n)) & 0x7f;
-        if c == 0 {
-            break;
-        }
-        buf[n] = c as u8;
-        n += 1;
-    }
-    &buf[..n]
+    unpack(k, buf)
 }
 
 /// Byte-wise order of the IDs behind two keys.
@@ -157,6 +226,43 @@ mod tests {
             }
             let s = &buf[..n];
             assert_eq!(unsafe { pack_wide(s) }, pack(s), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn order_keys_compare_like_bytes() {
+        // Values as they sit in a line: each followed by a separator.
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut vals: Vec<&'static [u8]> = Vec::new();
+        for i in 0..3000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let n = match i % 4 {
+                0 => 1 + (seed % 9) as usize,
+                1 => 33,
+                2 => 1 + (seed % 40) as usize,
+                _ => 9 + (seed % 3) as usize,
+            };
+            let mut v: Vec<u8> = (0..n).map(|j| b"0123456789abcdefk\x7f"[(seed.rotate_left(5 * j as u32) % 18) as usize]).collect();
+            if i % 7 == 0 && n > 2 {
+                v[n / 2] = 0xc3;
+            }
+            v.push(if i % 2 == 0 { b',' } else { b'"' });
+            v.extend_from_slice(&[0; 16]);
+            let leaked: &'static [u8] = Box::leak(v.into_boxed_slice());
+            vals.push(&leaked[..n]);
+        }
+        let big: &'static [u8] = Box::leak([vec![b'a'; 70_000], b",".to_vec(), vec![0; 16]].concat().into_boxed_slice());
+        let big2: &'static [u8] = Box::leak([vec![b'a'; 69_999], b"\"".to_vec(), vec![0; 16]].concat().into_boxed_slice());
+        vals.push(&big[..70_000]);
+        vals.push(&big2[..69_999]);
+        let keys: Vec<u64> = vals.iter().enumerate().map(|(i, v)| order_key_w(v, i % 3 != 0)).collect();
+        let n = vals.len();
+        for i in 0..n {
+            for j in (0..n).step_by(7).chain([n - 2, n - 1]) {
+                assert_eq!(order_cmp(keys[i], keys[j]), vals[i].cmp(vals[j]), "{:?} {:?}", vals[i], vals[j]);
+            }
         }
     }
 
