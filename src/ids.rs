@@ -4,8 +4,9 @@
 //! campaign and product IDs too) packs exactly into 63 bits, 7 bits a byte,
 //! first byte highest, so packed keys compare like the strings, byte by
 //! byte. Any other ID (longer, or with NUL or non-ASCII bytes) is "odd": its
-//! key is the top bit plus a 63-bit hash, and its bytes are kept in a side
-//! table.
+//! key is the top bit plus a 63-bit hash, and its bytes are found by key
+//! where they are needed. IDs that are only ordered, never matched, can
+//! instead use an order key (`order_key_w`) that holds their address.
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -33,13 +34,63 @@ fn pack(s: &[u8]) -> Option<u64> {
     Some(v)
 }
 
-/// `pack` with PEXT.
+/// Set by `init` on CPUs whose PEXT is microcoded and slow (AMD before
+/// Zen 3): `pack_wide` then gathers the bits with shifts.
+static SLOW_PEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Picks the bit gather for this CPU; call once before any packing.
+pub fn init() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::__cpuid;
+        // SAFETY: CPUID leaves 0 and 1 exist on every x86-64 CPU (the call
+        // is only unsafe on older compilers).
+        #[allow(unused_unsafe)]
+        let (v, f) = unsafe { (__cpuid(0), __cpuid(1)) };
+        let amd = (v.ebx, v.edx, v.ecx) == (0x6874_7541, 0x6974_6e65, 0x444d_4163) // AuthenticAMD
+            || (v.ebx, v.edx, v.ecx) == (0x6f67_7948, 0x6e65_476e, 0x656e_6975); // HygonGenuine
+        let base = f.eax >> 8 & 0xf;
+        let family = if base == 0xf { base + (f.eax >> 20 & 0xff) } else { base };
+        // SS_GATHER7 forces the shifts, for testing.
+        let slow = amd && family < 0x19 || std::env::var_os("SS_GATHER7").is_some();
+        SLOW_PEXT.store(slow, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The low 7 bits of each byte of x, packed together from the bottom:
+/// PEXT with mask 0x7f7f_7f7f_7f7f_7f7f, for x whose top bits are clear.
+#[inline(always)]
+fn gather7(x: u64) -> u64 {
+    let x = (x & 0x007f_007f_007f_007f) | (x >> 1 & 0x3f80_3f80_3f80_3f80);
+    let x = (x & 0x0000_3fff_0000_3fff) | (x >> 2 & 0x0fff_c000_0fff_c000);
+    (x & 0x0fff_ffff) | (x >> 4 & 0x00ff_ffff_f000_0000)
+}
+
+/// The inverse of `gather7`: PDEP with mask 0x7f7f_7f7f_7f7f_7f7f.
+#[inline(always)]
+pub fn scatter7(x: u64) -> u64 {
+    let x = (x & 0x0fff_ffff) | (x & 0x00ff_ffff_f000_0000) << 4;
+    let x = (x & 0x0000_3fff_0000_3fff) | (x & 0x0fff_c000_0fff_c000) << 2;
+    (x & 0x007f_007f_007f_007f) | (x & 0x3f80_3f80_3f80_3f80) << 1
+}
+
+/// `pack` with wide reads and PEXT (or `gather7`).
 ///
 /// # Safety
 /// 16 bytes from `s.as_ptr()` must be readable.
 #[cfg(target_feature = "bmi2")]
 #[inline(always)]
 unsafe fn pack_wide(s: &[u8]) -> Option<u64> {
+    pack_wide_with(s, SLOW_PEXT.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// `pack_wide`, with `gather7` if `slow`.
+///
+/// # Safety
+/// As for `pack_wide`.
+#[cfg(target_feature = "bmi2")]
+#[inline(always)]
+unsafe fn pack_wide_with(s: &[u8], slow: bool) -> Option<u64> {
     use std::arch::x86_64::{_bzhi_u64, _pext_u64};
     let n = s.len();
     if n.wrapping_sub(1) > 8 {
@@ -57,7 +108,9 @@ unsafe fn pack_wide(s: &[u8]) -> Option<u64> {
     if bad != 0 || (n == 9 && b.wrapping_sub(1) >= 0x7f) {
         return None;
     }
-    Some(_pext_u64(_bzhi_u64(raw, bits).swap_bytes(), 0x7f7f_7f7f_7f7f_7f7f) << 7 | b)
+    let x = _bzhi_u64(raw, bits).swap_bytes();
+    let packed = if slow { gather7(x) } else { _pext_u64(x, 0x7f7f_7f7f_7f7f_7f7f) };
+    Some(packed << 7 | b)
 }
 
 #[cfg(not(target_feature = "bmi2"))]
@@ -123,31 +176,49 @@ pub fn key_keep_w(s: &'static [u8], wide: bool, odd: &mut Vec<(u64, &'static [u8
     }
 }
 
-/// An order key for a click ID, which is only ever compared, never
-/// matched: packed if it packs, else ODD, its length (all ones if it does
-/// not fit in 16 bits) and the address of its bytes. The bytes end before
-/// the next `,` or `"`, since no value holds one.
+/// `key_keep_w`, keeping an odd ID as its `addr_key`.
 #[inline(always)]
-pub fn order_key_w(s: &'static [u8], wide: bool) -> u64 {
+pub fn key_note_w(s: &'static [u8], wide: bool, odd: &mut Vec<(u64, u64)>) -> u64 {
     match if wide { unsafe { pack_wide(s) } } else { pack(s) } {
         Some(v) => v,
         None => {
-            let p = s.as_ptr() as u64;
-            debug_assert!(p < 1 << 47);
-            ODD | (s.len().min(0xffff) as u64) << 47 | p
+            let k = hash_odd(s);
+            odd.push((k, addr_key(s)));
+            k
         }
     }
 }
 
+/// An order key for a click ID, which is only ever compared, never
+/// matched: packed if it packs, else ODD, its length (all ones if it does
+/// not fit in 16 bits) and the address of its bytes. The bytes end before
+/// the next `,`, `"` or newline, since no value holds one, or at the zeros
+/// after the end of a file.
+#[inline(always)]
+pub fn order_key_w(s: &'static [u8], wide: bool) -> u64 {
+    match if wide { unsafe { pack_wide(s) } } else { pack(s) } {
+        Some(v) => v,
+        None => addr_key(s),
+    }
+}
+
+/// The odd `order_key_w` of an ID that does not pack.
+#[inline]
+pub fn addr_key(s: &'static [u8]) -> u64 {
+    let p = s.as_ptr() as u64;
+    debug_assert!(p < 1 << 47);
+    ODD | (s.len().min(0xffff) as u64) << 47 | p
+}
+
 /// The bytes behind an odd `order_key_w`.
-fn order_bytes(k: u64) -> &'static [u8] {
+pub fn order_bytes(k: u64) -> &'static [u8] {
     let p = (k & ((1 << 47) - 1)) as *const u8;
     let mut n = (k >> 47 & 0xffff) as usize;
     // SAFETY: p points into a live input mapping, at a value ended by a
     // separator; its length is n unless that was too large to keep.
     unsafe {
         if n == 0xffff {
-            while *p.add(n) != b',' && *p.add(n) != b'"' {
+            while !matches!(*p.add(n), b',' | b'"' | b'\n' | 0) {
                 n += 1;
             }
         }
@@ -225,7 +296,11 @@ mod tests {
                 *b = if r % 4 == 0 { pool[r % pool.len()] } else { b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"[r % 63] };
             }
             let s = &buf[..n];
-            assert_eq!(unsafe { pack_wide(s) }, pack(s), "{s:?}");
+            assert_eq!(unsafe { pack_wide_with(s, false) }, pack(s), "{s:?}");
+            assert_eq!(unsafe { pack_wide_with(s, true) }, pack(s), "{s:?}");
+            if let Some(v) = pack(s) {
+                assert_eq!(gather7(scatter7(v >> 7)), v >> 7);
+            }
         }
     }
 
@@ -268,7 +343,6 @@ mod tests {
 
     #[test]
     fn packing_keeps_order_and_bytes() {
-        let odd = Odd::default();
         let words: [&[u8]; 16] = [
             b"0", b"U1", b"u", b"u1", b"u10", b"u1a", b"u2", b"zzzzzzzzz", b"A", b"c_1", b"c_10", b"cZ", b"ca", b" u1",
             b"u1 ", b"A\tB",
@@ -276,7 +350,7 @@ mod tests {
         for a in words {
             let ka = pack(a).unwrap();
             let mut buf = [0u8; 10];
-            assert_eq!(bytes(ka, &mut buf, &odd), a);
+            assert_eq!(unpack(ka, &mut buf), a);
             for b in words {
                 assert_eq!(ka.cmp(&pack(b).unwrap()), a.cmp(b), "{a:?} {b:?}");
             }

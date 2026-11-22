@@ -1043,9 +1043,10 @@ impl LinkTail {
 struct ParseOut {
     ev: Arena<Ev>,
     ck: Arena<Ck>,
-    /// The odd user IDs of valid event copies, one entry a copy; once the
-    /// thread's parsing is done, grouped by person bucket (see `odd_at`).
-    odd: Vec<(u64, &'static [u8])>,
+    /// The odd user IDs of valid event copies (key and `ids::addr_key`),
+    /// one entry a copy; once the thread's parsing is done, grouped by
+    /// person bucket (see `odd_at`).
+    odd: Vec<(u64, u64)>,
     odd_at: Vec<u32>,
     scratch: Vec<Ck>,
     keys: Vec<u64>,
@@ -1288,6 +1289,7 @@ struct Session {
 
 fn main() {
     let t_start = Instant::now();
+    ids::init();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out_dir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let nthreads: usize = std::env::var("NCPU")
@@ -1417,7 +1419,9 @@ fn main() {
         .map(|_| ParseOut {
             ev: Arena::new(nb_ev, per_ev),
             ck: Arena::new(nb_p, per_ck),
-            odd: Vec::new(),
+            // About 1 in 8 user IDs is odd; the capacity is only committed
+            // as it fills.
+            odd: Vec::with_capacity(est_ev / nthreads / 5),
             odd_at: Vec::new(),
             scratch: Vec::new(),
             keys: Vec::new(),
@@ -1445,13 +1449,16 @@ fn main() {
         for b in 0..nb_p {
             at[b + 1] += at[b];
         }
-        let mut sorted = vec![(0u64, &[][..]); out.odd.len()];
+        let mut sorted: Vec<(u64, u64)> = Vec::with_capacity(out.odd.len());
         let mut next = at.clone();
         for &(k, v) in &out.odd {
             let b = bucket_of(k, p_shift);
-            sorted[next[b] as usize] = (k, v);
+            // SAFETY: bucket b's places are at[b]..at[b + 1], below len.
+            unsafe { sorted.as_mut_ptr().add(next[b] as usize).write((k, v)) };
             next[b] += 1;
         }
+        // SAFETY: every place was written once.
+        unsafe { sorted.set_len(out.odd.len()) };
         out.odd = sorted;
         out.odd_at = at;
     };
@@ -1637,7 +1644,7 @@ struct EventSink<'a> {
     ctx: &'a Ctx,
     shift: u32,
     ev: &'a mut Arena<Ev>,
-    odd: &'a mut Vec<(u64, &'static [u8])>,
+    odd: &'a mut Vec<(u64, u64)>,
     pending: Pending<Ev>,
 }
 
@@ -1672,7 +1679,7 @@ impl csv::Sink for EventSink<'_> {
                             _ => false,
                         };
                     if valid {
-                        e.uid = ids::key_keep_w(uid, uid_w, self.odd);
+                        e.uid = ids::key_note_w(uid, uid_w, self.odd);
                         e.ts = (t - ctx.t0) as u32;
                     }
                 }
@@ -1753,7 +1760,7 @@ fn odd_name(person: u64, b: usize, parse_outs: &[ParseOut], links: &Links) -> &'
     for po in parse_outs {
         for &(k, v) in &po.odd[po.odd_at[b] as usize..po.odd_at[b + 1] as usize] {
             if k == person {
-                return v;
+                return ids::order_bytes(v);
             }
         }
     }

@@ -288,23 +288,15 @@ unsafe fn put_bytes(p: *mut u8, v: &[u8]) -> usize {
 /// Writes a packed ID as a BYTE_ARRAY value at p: at most 17 bytes.
 #[inline(always)]
 unsafe fn put_id(p: *mut u8, k: u64) -> usize {
-    #[cfg(target_feature = "bmi2")]
-    {
-        // The inverse of the packing: bytes 0..8 from bits 7..63, byte 8
-        // from bits 0..7. The bytes after the ID are zero.
-        let w = std::arch::x86_64::_pdep_u64(k >> 7, 0x7f7f_7f7f_7f7f_7f7f).swap_bytes();
-        let n8 = 8 - (w.leading_zeros() / 8) as usize;
-        let n = n8 + (n8 == 8 && k & 0x7f != 0) as usize;
-        put(p, (n as u32).to_le_bytes());
-        put(p.add(4), w.to_le_bytes());
-        *p.add(12) = (k & 0x7f) as u8;
-        return 4 + n;
-    }
-    #[allow(unreachable_code)]
-    {
-        let mut buf = [0u8; 10];
-        put_bytes(p, ids::unpack(k, &mut buf))
-    }
+    // The inverse of the packing: bytes 0..8 from bits 7..63, byte 8 from
+    // bits 0..7. The bytes after the ID are zero.
+    let w = ids::scatter7(k >> 7).swap_bytes();
+    let n8 = 8 - (w.leading_zeros() / 8) as usize;
+    let n = n8 + (n8 == 8 && k & 0x7f != 0) as usize;
+    put(p, (n as u32).to_le_bytes());
+    put(p.add(4), w.to_le_bytes());
+    *p.add(12) = (k & 0x7f) as u8;
+    4 + n
 }
 
 /// One thread's user_daily rows as each column's PLAIN values, appended as
