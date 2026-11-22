@@ -624,20 +624,6 @@ extern "C" {
     fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut std::ffi::c_void;
 }
 
-/// Drops the page mappings of the whole pages inside `chunk`, a read-only
-/// file mapping. Its data stays in the page cache and would fault back in;
-/// this only spreads over the workers the unmapping that exit would do.
-fn release(chunk: &[u8]) {
-    const PAGE: usize = 4096;
-    const MADV_DONTNEED: i32 = 4;
-    let start = (chunk.as_ptr() as usize).next_multiple_of(PAGE);
-    let end = (chunk.as_ptr() as usize + chunk.len()) & !(PAGE - 1);
-    if end > start {
-        // SAFETY: the range is inside a live read-only file mapping.
-        unsafe { madvise(start as *mut std::ffi::c_void, end - start, MADV_DONTNEED) };
-    }
-}
-
 /// Maps the pages of `chunk` (a file mapping) in one call, instead of a
 /// fault per 64 KB. Kernels before 5.14 refuse; the pages then fault in.
 fn populate(chunk: &[u8]) {
@@ -1025,7 +1011,14 @@ impl LinkTail {
     /// Fills part `j` of `parts` of the map; parts may be filled at once.
     fn fill(&self, j: usize, parts: usize) {
         let np = self.id_start.len() - 1;
-        for p in np * j / parts..np * (j + 1) / parts {
+        let (from, to) = (np * j / parts, np * (j + 1) / parts);
+        // Zeros written first: an insert reads its slot before writing it,
+        // and a read of a fresh page maps the shared zero page, which the
+        // write then copies, flushing the TLBs of every thread.
+        let map = &self.links.map;
+        // SAFETY: these partitions' slots, only touched by this call.
+        unsafe { std::ptr::write_bytes(map.slots.ptr.add(map.base[from] as usize), 0, (map.base[to] - map.base[from]) as usize) };
+        for p in from..to {
             for i in self.id_start[p] as usize..self.id_start[p + 1] as usize {
                 if self.names[i] != self.keys[i] {
                     // SAFETY: the ids of partition p are keys of partition
@@ -1088,12 +1081,18 @@ struct Tp {
     id: u32,
 }
 
-/// Radix digits of ts: three of 11 bits cover the u32 times of the window.
-const DIGIT: usize = 1 << 11;
+/// Events are grouped by bins of 2^BIN_SHIFT ms, about 17.5 minutes: two
+/// events of a person in one bin are less than 30 minutes apart, so in one
+/// session, and the gap between two bins is the gap from the earlier one's
+/// latest event to the later one's first.
+const BIN_SHIFT: u32 = 20;
+/// u32 times since t0 stay below 2^31 (the window and the week before it).
+const BINS: usize = 1 << (31 - BIN_SHIFT);
 
 /// Scratch for grouping one bucket's events and clicks by person: a small
-/// table gives each person a dense index; events are sorted by ts with a
-/// radix sort, then grouped (stably) by a counting sort.
+/// table gives each person a dense index; events are sorted by bin, then
+/// grouped (stably) by person, both with a counting sort; clicks are grouped
+/// by person and then sorted by ts.
 #[derive(Default)]
 struct Group {
     table: Vec<(u64, u32)>,
@@ -1108,34 +1107,10 @@ struct Group {
     cks: Vec<Ck>,
 }
 
-/// Moves `src` to `dst` in the order of `key`, given each key's first
-/// place in `at`; stable.
-#[inline(always)]
-fn radix_pass<T: Copy>(src: &[T], dst: &mut Vec<T>, at: &mut [u32], key: impl Fn(&T) -> usize) {
-    dst.clear();
-    dst.reserve(src.len());
-    let out = dst.as_mut_ptr();
-    assert_eq!(at.len(), DIGIT);
-    for t in src {
-        let k = key(t) & (DIGIT - 1);
-        // SAFETY: k < DIGIT = at.len(); the places of all keys are below
-        // src.len().
-        unsafe {
-            let c = at.get_unchecked_mut(k);
-            out.add(*c as usize).write(*t);
-            *c += 1;
-        }
-    }
-    // SAFETY: every place in 0..len was written once.
-    unsafe { dst.set_len(src.len()) };
-}
-
 impl Group {
-
     /// Fills evs/starts and cks/ck_starts: person p owns
-    /// evs[starts[p]..starts[p + 1]] sorted by ts, and the same range of cks
-    /// sorted by ts (ties in input order). Clicks of a person with no events
-    /// are dropped.
+    /// evs[starts[p]..starts[p + 1]] in order of bin, and the same range of
+    /// cks sorted by ts. Clicks of a person with no events are dropped.
     fn build(&mut self, ev_parts: &[&[Pe]], ck_parts: &[&[Ck]]) {
         let n: usize = ev_parts.iter().map(|p| p.len()).sum();
         let size = (n * 2).next_power_of_two().max(16);
@@ -1146,16 +1121,28 @@ impl Group {
         let table = &mut self.table[..size];
         self.persons.clear();
         self.filled.clear();
-        // Each event with its person's index; the counts of every ts digit
-        // and of every person come on the way.
+        // Each event with its person's index; the counts of every bin and
+        // of every person come on the way.
         self.hist.clear();
-        self.hist.resize(3 * DIGIT, 0);
+        self.hist.resize(BINS, 0);
         self.starts.clear();
         self.starts.push(0);
         self.evs.clear();
         self.evs.reserve(n);
         let hist = &mut self.hist[..];
-        for part in ev_parts {
+        for (pi, part) in ev_parts.iter().enumerate() {
+            // The next block's lines are fetched meanwhile: blocks are 1 KB
+            // apart from each other, too short for the hardware to follow.
+            if let Some(next) = ev_parts.get(pi + 1) {
+                let p = next.as_ptr() as *const i8;
+                for k in (0..next.len() * std::mem::size_of::<Pe>()).step_by(64) {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                        _mm_prefetch(p.add(k), _MM_HINT_T0);
+                    }
+                }
+            }
             for e in *part {
                 let mut i = slot_of(e.person, shift);
                 let id = loop {
@@ -1173,30 +1160,34 @@ impl Group {
                     }
                     i = (i + 1) & mask;
                 };
-                // SAFETY: id < np < starts.len(); ts < 2^31, so every digit
-                // index is below 3 * DIGIT = hist.len().
+                // SAFETY: id < np < starts.len(); ts < 2^31, so its bin is
+                // below BINS = hist.len().
                 unsafe {
                     *self.starts.get_unchecked_mut(id as usize + 1) += 1;
-                    *hist.get_unchecked_mut(e.ts as usize & (DIGIT - 1)) += 1;
-                    *hist.get_unchecked_mut(DIGIT + (e.ts as usize >> 11 & (DIGIT - 1))) += 1;
-                    *hist.get_unchecked_mut(2 * DIGIT + (e.ts as usize >> 22)) += 1;
+                    *hist.get_unchecked_mut((e.ts >> BIN_SHIFT) as usize) += 1;
                 }
                 self.evs.push(Tp { ts: e.ts, pc: e.pc, id });
             }
         }
         let np = self.persons.len();
-        for d in hist.chunks_mut(DIGIT) {
-            let mut at = 0;
-            for c in d {
-                (*c, at) = (at, at + *c);
+        let mut at = 0;
+        for c in hist.iter_mut() {
+            (*c, at) = (at, at + *c);
+        }
+        self.tmp.clear();
+        self.tmp.reserve(n);
+        let out = self.tmp.as_mut_ptr();
+        for t in &self.evs {
+            // SAFETY: the bin's places are below n.
+            unsafe {
+                let c = hist.get_unchecked_mut((t.ts >> BIN_SHIFT) as usize);
+                out.add(*c as usize).write(*t);
+                *c += 1;
             }
         }
-        let (h0, rest) = hist.split_at_mut(DIGIT);
-        let (h1, h2) = rest.split_at_mut(DIGIT);
-        radix_pass(&self.evs, &mut self.tmp, h0, |t| t.ts as usize);
-        radix_pass(&self.tmp, &mut self.evs, h1, |t| t.ts as usize >> 11);
-        radix_pass(&self.evs, &mut self.tmp, h2, |t| t.ts as usize >> 22);
-        // Then by person, stably: each person's events come out by ts.
+        // SAFETY: every place in 0..n was written once.
+        unsafe { self.tmp.set_len(n) };
+        // Then by person, stably: each person's events come out by bin.
         for p in 0..np {
             self.starts[p + 1] += self.starts[p];
         }
@@ -1205,17 +1196,19 @@ impl Group {
         let out = self.evs.as_mut_ptr();
         let mut at: Vec<u32> = self.starts[..np].to_vec();
         for t in &self.tmp {
-            let c = &mut at[t.id as usize];
             // SAFETY: person p's places are starts[p]..starts[p + 1] <= n.
-            unsafe { out.add(*c as usize).write(*t) };
-            *c += 1;
+            unsafe {
+                let c = at.get_unchecked_mut(t.id as usize);
+                out.add(*c as usize).write(*t);
+                *c += 1;
+            }
         }
         // SAFETY: every place in 0..n was written once.
         unsafe { self.evs.set_len(n) };
 
-        // Clicks the same way, those of persons without events dropped; the
-        // person field becomes the person's index.
-        hist.fill(0);
+        // Clicks by person, those of persons without events dropped; the
+        // person field becomes the person's index. Then each person's
+        // clicks by ts.
         self.ck_starts.clear();
         self.ck_starts.resize(np + 1, 0);
         self.ck_tmp.clear();
@@ -1235,44 +1228,45 @@ impl Group {
                 if id == u32::MAX {
                     continue;
                 }
-                // SAFETY: as for the events.
-                unsafe {
-                    *self.ck_starts.get_unchecked_mut(id as usize + 1) += 1;
-                    *hist.get_unchecked_mut(c.ts as usize & (DIGIT - 1)) += 1;
-                    *hist.get_unchecked_mut(DIGIT + (c.ts as usize >> 11 & (DIGIT - 1))) += 1;
-                    *hist.get_unchecked_mut(2 * DIGIT + (c.ts as usize >> 22)) += 1;
-                }
+                // SAFETY: id < np.
+                unsafe { *self.ck_starts.get_unchecked_mut(id as usize + 1) += 1 };
                 self.ck_tmp.push(Ck { person: id as u64, ..*c });
             }
         }
-        for d in hist.chunks_mut(DIGIT) {
-            let mut at = 0;
-            for c in d {
-                (*c, at) = (at, at + *c);
-            }
-        }
-        let (h0, rest) = hist.split_at_mut(DIGIT);
-        let (h1, h2) = rest.split_at_mut(DIGIT);
-        radix_pass(&self.ck_tmp, &mut self.cks, h0, |c| c.ts as usize);
-        radix_pass(&self.cks, &mut self.ck_tmp, h1, |c| c.ts as usize >> 11);
-        radix_pass(&self.ck_tmp, &mut self.cks, h2, |c| c.ts as usize >> 22);
         for p in 0..np {
             self.ck_starts[p + 1] += self.ck_starts[p];
         }
-        let m = self.cks.len();
-        self.ck_tmp.clear();
-        self.ck_tmp.reserve(m);
-        let out = self.ck_tmp.as_mut_ptr();
+        let m = self.ck_tmp.len();
+        self.cks.clear();
+        self.cks.reserve(m);
+        let out = self.cks.as_mut_ptr();
         let mut at: Vec<u32> = self.ck_starts[..np].to_vec();
-        for c in &self.cks {
-            let k = &mut at[c.person as usize];
+        for c in &self.ck_tmp {
             // SAFETY: person p's places are ck_starts[p]..ck_starts[p + 1] <= m.
-            unsafe { out.add(*k as usize).write(*c) };
-            *k += 1;
+            unsafe {
+                let k = at.get_unchecked_mut(c.person as usize);
+                out.add(*k as usize).write(*c);
+                *k += 1;
+            }
         }
         // SAFETY: every place in 0..m was written once.
-        unsafe { self.ck_tmp.set_len(m) };
-        std::mem::swap(&mut self.cks, &mut self.ck_tmp);
+        unsafe { self.cks.set_len(m) };
+        for p in 0..np {
+            let cks = &mut self.cks[self.ck_starts[p] as usize..self.ck_starts[p + 1] as usize];
+            if cks.len() <= 24 {
+                for i in 1..cks.len() {
+                    let c = cks[i];
+                    let mut j = i;
+                    while j > 0 && cks[j - 1].ts > c.ts {
+                        cks[j] = cks[j - 1];
+                        j -= 1;
+                    }
+                    cks[j] = c;
+                }
+            } else {
+                cks.sort_unstable_by_key(|c| c.ts);
+            }
+        }
         for &i in &self.filled {
             table[i as usize] = (0, 0);
         }
@@ -1283,7 +1277,7 @@ impl Group {
 struct Session {
     start: u32,
     day: u32,
-    revenue: u32,
+    revenue: u64,
     purchase: bool,
 }
 
@@ -1469,7 +1463,6 @@ fn main() {
         } else if i <= n_ev_chunks {
             populate(ev_chunks[i - 1]);
             parse_events(ev_chunks[i - 1], ctx, ev_shift, out);
-            release(ev_chunks[i - 1]);
         } else if i <= n_ev_chunks + FILLS {
             tail.wait().fill(i - 1 - n_ev_chunks, FILLS);
             filled.fetch_add(1, Ordering::Release);
@@ -1481,7 +1474,6 @@ fn main() {
             let c = ck_chunks[i - 1 - n_ev_chunks - FILLS];
             populate(c);
             parse_clicks(c, ctx, &tail.wait().links, p_shift, out);
-            release(c);
         }
     }, group_odd);
     let links = tail.into_inner().expect("links").links;
@@ -1622,8 +1614,10 @@ fn main() {
         }, then);
     }
     eprintln!("persons: {:?}", t_start.elapsed());
-    // The arenas are done with; free them in the background while writing.
-    std::thread::spawn(move || drop((dedup_outs, parse_outs)));
+    // The arenas, like the input mappings, are left to exit: dropping them
+    // early unmaps pages, and every unmapping flushes the TLBs of all the
+    // threads still working.
+    std::mem::forget((dedup_outs, parse_outs));
 
     // ---- write
     output::write_rest(&user_dir, &camp_dir, ctx, &person_outs);
@@ -1791,9 +1785,22 @@ fn process_person(ctx: &Ctx, person: u64, name: &[u8], evs: &[Tp], cks: &[Ck], o
         users.push(row.person, name, row.day, row.sessions, row.events, row.revenue, top);
     };
 
-    for e in evs {
-        if out.sess.is_empty() || (e.ts - prev) as i64 > GAP {
-            let d = ctx.day_of(e.ts) as u32;
+    // Bin by bin (see BIN_SHIFT): its first and latest ts decide whether
+    // it starts a session; a session's day is the day of its start.
+    let mut i = 0;
+    while i < evs.len() {
+        let bin = evs[i].ts >> BIN_SHIFT;
+        let (mut lo, mut hi, mut revenue) = (u32::MAX, 0u32, 0u64);
+        let mut j = i;
+        while j < evs.len() && evs[j].ts >> BIN_SHIFT == bin {
+            let e = evs[j];
+            lo = lo.min(e.ts);
+            hi = hi.max(e.ts);
+            revenue += (e.pc & 0xff_ffff) as u64;
+            j += 1;
+        }
+        if out.sess.is_empty() || (lo - prev) as i64 > GAP {
+            let d = ctx.day_of(lo) as u32;
             if d != cur_day {
                 if cur_day != u32::MAX {
                     flush(&row, &mut out.catsum, &mut out.users);
@@ -1801,19 +1808,24 @@ fn process_person(ctx: &Ctx, person: u64, name: &[u8], evs: &[Tp], cks: &[Ck], o
                 cur_day = d;
                 row = UserRow { person, day: (ctx.day0 + d as i64) as i32, sessions: 0, events: 0, revenue: 0 };
             }
-            out.sess.push(Session { start: e.ts, day: d, revenue: 0, purchase: false });
+            out.sess.push(Session { start: lo, day: d, revenue: 0, purchase: false });
             row.sessions += 1;
         }
-        prev = e.ts;
-        row.events += 1;
-        let price = e.pc & 0xff_ffff;
-        if price > 0 {
+        prev = hi;
+        row.events += (j - i) as i64;
+        if revenue > 0 {
             let s = out.sess.last_mut().unwrap();
-            s.revenue += price;
+            s.revenue += revenue;
             s.purchase = true;
-            row.revenue += price as i64;
-            out.catsum[(e.pc >> 24) as usize] += price as u64;
+            row.revenue += revenue as i64;
+            for e in &evs[i..j] {
+                let price = e.pc & 0xff_ffff;
+                if price > 0 {
+                    out.catsum[(e.pc >> 24) as usize] += price as u64;
+                }
+            }
         }
+        i = j;
     }
     flush(&row, &mut out.catsum, &mut out.users);
 
@@ -1840,7 +1852,7 @@ fn process_person(ctx: &Ctx, person: u64, name: &[u8], evs: &[Tp], cks: &[Ck], o
         let st = &mut out.credit[camp * nd + s.day as usize];
         st.sessions += 1;
         st.purchasing += s.purchase as u32;
-        st.revenue += s.revenue as u64;
+        st.revenue += s.revenue;
     }
 
     // Assists: a click at t assists the sessions starting in [t, t + 7 days].
