@@ -808,7 +808,7 @@ struct LinkPrep {
 fn prepare_links(files: &[PathBuf], nthreads: usize) -> LinkPrep {
     let mut pieces = Vec::new();
     for p in files {
-        chunks(body(leak_read(p)), CLICK_CHUNK, &mut pieces);
+        chunks(body(leak_read(p)), CLICK_CHUNK / 4, &mut pieces);
     }
     let mut outs: Vec<(Vec<(u64, u64)>, Vec<(u64, &'static [u8])>)> = (0..nthreads).map(|_| (Vec::new(), Vec::new())).collect();
     run_par(&mut outs, pieces.len(), |(pairs, odd), i| {
@@ -818,6 +818,7 @@ fn prepare_links(files: &[PathBuf], nthreads: usize) -> LinkPrep {
                 pairs.push((ids::key_keep_w(a, aw, odd), ids::key_keep_w(b, bw, odd)));
             }
         };
+        populate(pieces[i]);
         // SAFETY: `leak_read` pads its mappings.
         unsafe { csv::for_each_line_padded::<2>(pieces[i], &mut add) };
     });
@@ -940,9 +941,9 @@ fn prepare_links(files: &[PathBuf], nthreads: usize) -> LinkPrep {
     LinkPrep { pairs, off, odd, id_of, keys, id_start, shift }
 }
 
-/// The rest of the links: union-find and names, then the map, a partition
-/// per task on `nthreads` threads.
-fn build_links(prep: LinkPrep, nthreads: usize) -> Links {
+/// The links' sequential part: union-find and names; the map is made
+/// empty, for `LinkTail::fill` to fill.
+fn build_links(prep: LinkPrep) -> LinkTail {
     let LinkPrep { pairs, off, odd, id_of, keys, id_start, shift } = prep;
     let np = id_start.len() - 1;
     let odd_map: Odd = odd.iter().copied().collect();
@@ -993,18 +994,32 @@ fn build_links(prep: LinkPrep, nthreads: usize) -> Links {
     }
     let map = PartMap { slots: Zeroed::new(base[np] as usize), base, mask, shift };
     let bloom = Bloom::new(renamed);
-    let mut unit = vec![(); nthreads];
-    run_par(&mut unit, np, |_, p| {
-        for i in id_start[p] as usize..id_start[p + 1] as usize {
-            if names[i] != keys[i] {
-                // SAFETY: the ids of partition p are keys of partition p,
-                // and only this task inserts into it.
-                unsafe { map.insert_shared(keys[i], names[i]) };
-                bloom.insert_shared(keys[i]);
+    LinkTail { links: Links { map, bloom, odd }, names, keys, id_start }
+}
+
+/// The links with their map still to fill, and what fills it.
+struct LinkTail {
+    links: Links,
+    names: Vec<u64>,
+    keys: Vec<u64>,
+    id_start: Vec<u32>,
+}
+
+impl LinkTail {
+    /// Fills part `j` of `parts` of the map; parts may be filled at once.
+    fn fill(&self, j: usize, parts: usize) {
+        let np = self.id_start.len() - 1;
+        for p in np * j / parts..np * (j + 1) / parts {
+            for i in self.id_start[p] as usize..self.id_start[p + 1] as usize {
+                if self.names[i] != self.keys[i] {
+                    // SAFETY: the ids of partition p are keys of partition
+                    // p, and only this call inserts into it.
+                    unsafe { self.links.map.insert_shared(self.keys[i], self.names[i]) };
+                    self.links.bloom.insert_shared(self.keys[i]);
+                }
             }
         }
-    });
-    Links { map, bloom, odd }
+    }
 }
 
 // ---------------------------------------------------------------- main
@@ -1389,30 +1404,38 @@ fn main() {
         .collect();
     let t_parse = Instant::now();
     eprintln!("setup: {:?}", t_start.elapsed());
-    // The links' parallel part first, on all threads; the rest (mostly
-    // sequential) runs on one thread beside the event parse. Built wholly
-    // beside it, the links slow the parse more than they cost.
+    // The links' parallel part first, on all threads; the sequential part
+    // runs on one thread beside the event parse; the map is filled by
+    // FILLS tasks after the events, before the clicks. Built wholly beside
+    // the parse, the links slow it more than they cost.
     let prep = std::sync::Mutex::new(Some(prepare_links(&link_files, nthreads)));
     eprintln!("links prepared: {:?}", t_parse.elapsed());
-    let links: std::sync::OnceLock<Links> = std::sync::OnceLock::new();
-    run_par(&mut parse_outs, 1 + n_ev_chunks + ck_chunks.len(), |out, i| {
+    let tail: std::sync::OnceLock<LinkTail> = std::sync::OnceLock::new();
+    const FILLS: usize = 16;
+    let filled = AtomicUsize::new(0);
+    run_par(&mut parse_outs, 1 + n_ev_chunks + FILLS + ck_chunks.len(), |out, i| {
         if i == 0 {
-            let l = build_links(prep.lock().unwrap().take().expect("links"), 1);
+            let _ = tail.set(build_links(prep.lock().unwrap().take().expect("links")));
             eprintln!("links built: {:?}", t_parse.elapsed());
-            let _ = links.set(l);
         } else if i <= n_ev_chunks {
             populate(ev_chunks[i - 1]);
             parse_events(ev_chunks[i - 1], ctx, ev_shift, out);
             release(ev_chunks[i - 1]);
+        } else if i <= n_ev_chunks + FILLS {
+            tail.wait().fill(i - 1 - n_ev_chunks, FILLS);
+            filled.fetch_add(1, Ordering::Release);
         } else {
-            let links = links.wait();
-            let c = ck_chunks[i - 1 - n_ev_chunks];
+            // The map's fill tasks were all taken before this one.
+            while filled.load(Ordering::Acquire) < FILLS {
+                std::thread::yield_now();
+            }
+            let c = ck_chunks[i - 1 - n_ev_chunks - FILLS];
             populate(c);
-            parse_clicks(c, ctx, links, p_shift, out);
+            parse_clicks(c, ctx, &tail.wait().links, p_shift, out);
             release(c);
         }
     });
-    let links = links.into_inner().expect("links");
+    let links = tail.into_inner().expect("links").links;
     let mut odd: Odd = links.odd.iter().copied().collect();
     for o in &mut parse_outs {
         odd.extend(o.odd.drain(..));
